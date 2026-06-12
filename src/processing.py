@@ -2,16 +2,19 @@
 Core processing functions for synthetic clinical note generation.
 
 Adapted from nhsengland/synthetic_clinical_notes to use:
-  - Anthropic Claude API (default) or OpenAI API (fallback)
+  - Anthropic Claude API (default), OpenAI API, or Nebius vLLM
   - CSV-based I/O instead of Palantir Foundry
   - ICD-10 / OPCS-4 code-driven generation
 
 Environment variables:
-  LLM_PROVIDER     : 'anthropic' (default) or 'openai'
+  LLM_PROVIDER     : 'anthropic' (default), 'openai', or 'nebius'
   ANTHROPIC_API_KEY: required when LLM_PROVIDER=anthropic
   OPENAI_API_KEY   : required when LLM_PROVIDER=openai
+  NEBIUS_API_KEY   : required when LLM_PROVIDER=nebius
+  NEBIUS_BASE_URL  : Nebius vLLM endpoint (default: https://api.studio.nebius.com/v1/)
   ANTHROPIC_MODEL  : override default Anthropic model
   OPENAI_MODEL     : override default OpenAI model
+  NEBIUS_MODEL     : override default Nebius model
 """
 
 from __future__ import annotations
@@ -38,6 +41,8 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-6"
 DEFAULT_OPENAI_MODEL = "gpt-4o"
+DEFAULT_NEBIUS_MODEL = "meta-llama/Meta-Llama-3.1-70B-Instruct-fast"
+DEFAULT_NEBIUS_BASE_URL = "https://api.studio.nebius.com/v1/"
 
 # ---------------------------------------------------------------------------
 # LLM client helpers
@@ -45,7 +50,7 @@ DEFAULT_OPENAI_MODEL = "gpt-4o"
 
 
 def _get_provider() -> str:
-    """Return the configured LLM provider ('anthropic' or 'openai')."""
+    """Return the configured LLM provider ('anthropic', 'openai', or 'nebius')."""
     return os.environ.get("LLM_PROVIDER", "anthropic").lower().strip()
 
 
@@ -79,6 +84,23 @@ def _get_openai_client():
             "OPENAI_API_KEY environment variable not set."
         )
     return openai.OpenAI(api_key=api_key)
+
+
+def _get_nebius_client():
+    """Return an OpenAI-compatible client pointed at the Nebius vLLM endpoint."""
+    try:
+        import openai  # noqa: PLC0415
+    except ImportError as exc:
+        raise ImportError(
+            "openai package not installed. Run: pip install openai"
+        ) from exc
+    api_key = os.environ.get("NEBIUS_API_KEY")
+    if not api_key:
+        raise ValueError(
+            "NEBIUS_API_KEY environment variable not set."
+        )
+    base_url = os.environ.get("NEBIUS_BASE_URL", DEFAULT_NEBIUS_BASE_URL)
+    return openai.OpenAI(api_key=api_key, base_url=base_url)
 
 
 # ---------------------------------------------------------------------------
@@ -120,9 +142,11 @@ def call_llm(
         return _call_anthropic(prompt, model, temp, max_attempts, chat_history)
     elif provider == "openai":
         return _call_openai(prompt, model, temp, max_attempts, chat_history)
+    elif provider == "nebius":
+        return _call_nebius(prompt, model, temp, max_attempts, chat_history)
     else:
         raise ValueError(
-            f"Unknown LLM_PROVIDER '{provider}'. Must be 'anthropic' or 'openai'."
+            f"Unknown LLM_PROVIDER '{provider}'. Must be 'anthropic', 'openai', or 'nebius'."
         )
 
 
@@ -211,6 +235,50 @@ def _call_openai(
 
     raise RuntimeError(
         f"OpenAI LLM call failed after {max_attempts} attempts."
+    ) from last_exc
+
+
+def _call_nebius(
+    prompt: str,
+    model: str | None,
+    temp: float,
+    max_attempts: int,
+    chat_history: list[dict] | None,
+) -> str:
+    """Call Nebius serverless vLLM endpoint (OpenAI-compatible API)."""
+    client = _get_nebius_client()
+    model = model or os.environ.get("NEBIUS_MODEL", DEFAULT_NEBIUS_MODEL)
+
+    messages: list[dict] = []
+    if chat_history:
+        messages.extend(chat_history)
+    messages.append({"role": "user", "content": prompt})
+
+    last_exc: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temp,
+                max_tokens=4096,
+            )
+            return response.choices[0].message.content
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            wait = 2 ** attempt
+            logger.warning(
+                "Nebius call failed (attempt %d/%d): %s. Retrying in %ds.",
+                attempt,
+                max_attempts,
+                exc,
+                wait,
+            )
+            import time  # noqa: PLC0415
+            time.sleep(wait)
+
+    raise RuntimeError(
+        f"Nebius LLM call failed after {max_attempts} attempts."
     ) from last_exc
 
 

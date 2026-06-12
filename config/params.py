@@ -14,18 +14,25 @@ import os
 # LLM provider and model configuration
 # ---------------------------------------------------------------------------
 
-# LLM provider: 'anthropic' (default) or 'openai'
+# LLM provider: 'anthropic' (default), 'openai', or 'nebius'
 # Env var: LLM_PROVIDER
 LLM_PROVIDER: str = os.environ.get("LLM_PROVIDER", "anthropic")
 
 # Default model to use for generation
 # Anthropic default: claude-sonnet-4-6
 # OpenAI default:    gpt-4o
+# Nebius default:    meta-llama/Meta-Llama-3.1-70B-Instruct-fast
 # Env var: MODEL
-MODEL: str = os.environ.get(
-    "MODEL",
-    "claude-sonnet-4-6" if LLM_PROVIDER == "anthropic" else "gpt-4o",
-)
+_default_models = {
+    "anthropic": "claude-sonnet-4-6",
+    "openai": "gpt-4o",
+    "nebius": "meta-llama/Meta-Llama-3.1-70B-Instruct-fast",
+}
+MODEL: str = os.environ.get("MODEL", _default_models.get(LLM_PROVIDER, "claude-sonnet-4-6"))
+
+# Nebius vLLM endpoint base URL
+# Env var: NEBIUS_BASE_URL
+NEBIUS_BASE_URL: str = os.environ.get("NEBIUS_BASE_URL", "https://api.studio.nebius.com/v1/")
 
 # Sampling temperature for main generation (higher = more varied output)
 TEMPERATURE: float = float(os.environ.get("TEMPERATURE", "0.8"))
