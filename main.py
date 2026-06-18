@@ -9,11 +9,18 @@ Usage:
                    [--n-patients 5] [--output-dir data/output] \\
                    [--model claude-sonnet-4-6] [--llm-provider anthropic]
 
+    # Run against a Nebius serverless GPU endpoint instead:
+    python main.py --llm-provider nebius \\
+                   --model meta-llama/Meta-Llama-3.1-70B-Instruct-fast \\
+                   --icd10-codes I21.0 --n-patients 10
+
 Environment variables (override CLI args or provide defaults):
     ANTHROPIC_API_KEY  - required for anthropic provider
     OPENAI_API_KEY     - required for openai provider
-    LLM_PROVIDER       - 'anthropic' or 'openai'
-    MODEL              - model identifier
+    NEBIUS_API_KEY     - required for nebius provider
+    NEBIUS_BASE_URL    - Nebius endpoint (default: https://api.studio.nebius.com/v1/)
+    LLM_PROVIDER       - 'anthropic', 'openai', or 'nebius'
+    MODEL              - model identifier (e.g. any model id on your Nebius endpoint)
     N_PATIENTS         - number of patients to generate
     ICD10_CODES        - comma-separated ICD-10 codes
     OPCS4_CODES        - comma-separated OPCS-4 codes
@@ -137,16 +144,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=str,
         default=os.environ.get("MODEL", ""),
         help=(
-            "LLM model identifier. Defaults to 'claude-sonnet-4-6' for Anthropic "
-            "or 'gpt-4o' for OpenAI."
+            "LLM model identifier. Defaults to 'claude-sonnet-4-6' for Anthropic, "
+            "'gpt-4o' for OpenAI, or 'meta-llama/Meta-Llama-3.1-70B-Instruct-fast' "
+            "for Nebius. For Nebius this can be set to any model deployed on your "
+            "serverless endpoint."
         ),
     )
     parser.add_argument(
         "--llm-provider",
         type=str,
         default=os.environ.get("LLM_PROVIDER", "anthropic"),
-        choices=["anthropic", "openai"],
-        help="LLM provider to use (default: anthropic).",
+        choices=["anthropic", "openai", "nebius"],
+        help="LLM provider to use (default: anthropic). Use 'nebius' to run "
+        "against a Nebius AI Studio serverless GPU endpoint.",
     )
     parser.add_argument(
         "--test-mode",
