@@ -1,0 +1,31 @@
+# Self-contained GPU job image: serves the model with a local vLLM server
+# AND runs the generation pipeline in the same container, so a single
+# Nebius GPU job (e.g. --platform gpu-l40s-a) is enough — no separate
+# standing inference endpoint required.
+#
+# Use Dockerfile (not this one) if you'd rather call an already-running
+# Nebius AI Studio endpoint, Anthropic, or OpenAI — that image needs no GPU.
+FROM vllm/vllm-openai:latest
+
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+RUN chmod +x entrypoint.sh
+
+RUN mkdir -p /data/output
+
+ENV PYTHONUNBUFFERED=1
+ENV OUTPUT_DIR=/data/output
+# Default model if MODEL is not set; override per job to match the GPU
+# preset (7-8B models fit a single 24GB GPU, 70B class needs multi-GPU
+# or an A100/H100 80GB preset).
+ENV MODEL="Qwen/Qwen2.5-7B-Instruct"
+
+ENTRYPOINT ["./entrypoint.sh"]
