@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 import main
 from src import processing
 
@@ -160,18 +162,14 @@ class TestReflectionCheckWiredIntoRealPipeline:
         exit_code = main.run_pipeline(args)
         assert exit_code == 1
 
-    def test_legacy_icd10_codes_flag_still_works(self, tmp_path):
-        """--icd10-codes is deprecated but must keep working for existing
-        scripts/.env files - it's an alias for --diagnostic-codes."""
-        args = main.parse_args(
-            [
-                "--test-mode",
-                "--icd10-codes", "I21.0",
-                "--output-dir", str(tmp_path),
-            ]
-        )
-        exit_code = main.run_pipeline(args)
-        assert exit_code == 0
-
-        admissions_csv = (tmp_path / "synthetic_admissions.csv").read_text()
-        assert "I21.0" in admissions_csv
+    def test_icd10_codes_flag_no_longer_exists(self, tmp_path):
+        """--icd10-codes/--opcs4-codes were removed in favour of the generic
+        --diagnostic-codes/--procedure-codes flags - no silent alias."""
+        with pytest.raises(SystemExit):
+            main.parse_args(
+                [
+                    "--test-mode",
+                    "--icd10-codes", "I21.0",
+                    "--output-dir", str(tmp_path),
+                ]
+            )

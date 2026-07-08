@@ -25,9 +25,9 @@ Environment variables (override CLI args or provide defaults):
     LLM_PROVIDER           - 'anthropic', 'openai', or 'nebius'
     MODEL                  - model identifier (e.g. any model id on your Nebius endpoint)
     N_PATIENTS             - number of patients to generate
-    DIAGNOSTIC_CODES       - comma-separated diagnostic codes (legacy: ICD10_CODES)
+    DIAGNOSTIC_CODES       - comma-separated diagnostic codes
     DIAGNOSTIC_CODE_SYSTEM - diagnostic coding standard, default 'icd10'
-    PROCEDURE_CODES        - comma-separated procedure codes (legacy: OPCS4_CODES)
+    PROCEDURE_CODES        - comma-separated procedure codes
     PROCEDURE_CODE_SYSTEM  - procedure coding standard, default 'opcs4'
     OUTPUT_DIR             - output directory path
 """
@@ -121,11 +121,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--diagnostic-codes",
         type=str,
-        default=os.environ.get("DIAGNOSTIC_CODES", os.environ.get("ICD10_CODES", "")),
+        default=os.environ.get("DIAGNOSTIC_CODES", ""),
         help=(
             "Comma-separated diagnostic codes to drive admission generation "
-            "(e.g. 'I21.0,J18.1'). Overrides DIAGNOSTIC_CODES (or legacy "
-            "ICD10_CODES) env var. Interpreted under --diagnostic-code-system."
+            "(e.g. 'I21.0,J18.1'). Overrides DIAGNOSTIC_CODES env var. "
+            "Interpreted under --diagnostic-code-system."
         ),
     )
     parser.add_argument(
@@ -142,11 +142,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--procedure-codes",
         type=str,
-        default=os.environ.get("PROCEDURE_CODES", os.environ.get("OPCS4_CODES", "")),
+        default=os.environ.get("PROCEDURE_CODES", ""),
         help=(
             "Comma-separated procedure codes (e.g. 'K40.1,W37.1'). Overrides "
-            "PROCEDURE_CODES (or legacy OPCS4_CODES) env var. Interpreted under "
-            "--procedure-code-system."
+            "PROCEDURE_CODES env var. Interpreted under --procedure-code-system."
         ),
     )
     parser.add_argument(
@@ -159,11 +158,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "CPT, HCPCS)."
         ),
     )
-    # Deprecated aliases, kept for backward compatibility with existing
-    # scripts/.env files. Equivalent to --diagnostic-codes/--procedure-codes
-    # with the code system forced to icd10/opcs4 respectively.
-    parser.add_argument("--icd10-codes", type=str, default="", help=argparse.SUPPRESS)
-    parser.add_argument("--opcs4-codes", type=str, default="", help=argparse.SUPPRESS)
     parser.add_argument(
         "--n-patients",
         type=int,
@@ -883,33 +877,14 @@ def run_pipeline(args: argparse.Namespace) -> int:
         logger.error("Module import failed: %s", exc)
         return 1
 
-    # Resolve deprecated --icd10-codes/--opcs4-codes aliases: they win only
-    # if the corresponding generic flag was left at its default (empty).
-    diagnostic_codes_str = args.diagnostic_codes
     diagnostic_code_system = args.diagnostic_code_system
-    if not diagnostic_codes_str and args.icd10_codes:
-        logger.warning(
-            "--icd10-codes is deprecated, use --diagnostic-codes "
-            "(--diagnostic-code-system defaults to 'icd10')."
-        )
-        diagnostic_codes_str = args.icd10_codes
-        diagnostic_code_system = "icd10"
-
-    procedure_codes_str = args.procedure_codes
     procedure_code_system = args.procedure_code_system
-    if not procedure_codes_str and args.opcs4_codes:
-        logger.warning(
-            "--opcs4-codes is deprecated, use --procedure-codes "
-            "(--procedure-code-system defaults to 'opcs4')."
-        )
-        procedure_codes_str = args.opcs4_codes
-        procedure_code_system = "opcs4"
 
     # Parse and validate codes
     try:
         diagnostic_codes, procedure_codes = step_parse_codes(
-            diagnostic_codes_str, diagnostic_code_system,
-            procedure_codes_str, procedure_code_system, mods,
+            args.diagnostic_codes, diagnostic_code_system,
+            args.procedure_codes, procedure_code_system, mods,
         )
     except KeyError as exc:
         logger.error("Invalid code system: %s", exc)
