@@ -3,11 +3,17 @@ ICD-10 code handling for synthetic clinical note generation.
 
 ICD-10 (International Classification of Diseases, 10th Revision) codes follow
 the format: letter + 2 digits + optional decimal + digit(s), e.g. I21.0, J18.1.
+
+This module builds a src.codes.registry.CodeSystem from ICD10_CODES and
+registers it under the key 'icd10'. The functions below are thin wrappers
+around the generic registry implementation, kept for convenience and
+backward compatibility - equivalent behaviour is available for any
+registered code system via src.codes.registry directly.
 """
 
 from __future__ import annotations
 
-import re
+from src.codes import registry
 
 # ---------------------------------------------------------------------------
 # Curated ICD-10 code dictionary
@@ -557,15 +563,52 @@ ICD10_CODES: dict[str, dict] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Chapter-letter fallback specialty map, used for codes outside ICD10_CODES
+# ---------------------------------------------------------------------------
+_CHAPTER_SPECIALTY_MAP: dict[str, str] = {
+    "A": "Infectious Diseases",
+    "B": "Infectious Diseases",
+    "C": "Oncology",
+    "D": "Haematology",
+    "E": "Endocrinology",
+    "F": "Psychiatry",
+    "G": "Neurology",
+    "H": "Ophthalmology / ENT",
+    "I": "Cardiology",
+    "J": "Respiratory Medicine",
+    "K": "Gastroenterology / General Surgery",
+    "L": "Dermatology",
+    "M": "Rheumatology / Orthopaedics",
+    "N": "Nephrology / Urology",
+    "O": "Obstetrics",
+    "P": "Paediatrics / Neonatology",
+    "Q": "Genetics / Paediatrics",
+    "R": "Emergency Medicine",
+    "S": "Trauma and Orthopaedics",
+    "T": "Emergency Medicine",
+    "Z": "General Medicine",
+}
+
+CODE_SYSTEM = registry.CodeSystem(
+    key="icd10",
+    name="ICD-10",
+    kind="diagnostic",
+    codes=ICD10_CODES,
+    specialty_field="specialty",
+    type_field="admission_type",
+    chapter_map=_CHAPTER_SPECIALTY_MAP,
+    default_specialty="General Medicine",
+)
+registry.register_code_system(CODE_SYSTEM)
+
+
 def lookup_code(code: str) -> dict | None:
     """Return the metadata dict for an ICD-10 code, or None if not found.
 
     Performs a case-insensitive lookup and also tries the uppercased code.
     """
-    if not code:
-        return None
-    code = code.strip().upper()
-    return ICD10_CODES.get(code)
+    return registry.lookup_code(CODE_SYSTEM, code)
 
 
 def get_clinical_context(code: str) -> str:
@@ -573,28 +616,10 @@ def get_clinical_context(code: str) -> str:
 
     Example return value:
         "ICD-10 I21.0 (Acute transmural myocardial infarction of anterior wall):
-         This patient has been admitted as an emergency with an acute STEMI.
-         Specialty: Cardiology. Typical LOS: 4-7 days."
+         This patient is being managed as an emergency case. Specialty: Cardiology.
+         Typical length of stay: 4-7 days. ..."
     """
-    info = lookup_code(code)
-    if info is None:
-        return f"ICD-10 {code.upper()}: Code not found in reference dictionary."
-
-    los_min, los_max = info["typical_los_days"]
-    admission_word = "emergency" if info["admission_type"] == "emergency" else "elective"
-
-    context = (
-        f"ICD-10 {code.upper()} ({info['description']}): "
-        f"This patient is being admitted as a{'n' if admission_word[0] in 'aeiou' else ''} "
-        f"{admission_word} case. "
-        f"Chapter: {info['chapter_name']}. "
-        f"Specialty: {info['specialty']}. "
-        f"Typical length of stay: {los_min}-{los_max} days. "
-        f"When generating clinical notes and patient journey events, ensure all content "
-        f"is clinically appropriate for this diagnosis, including relevant investigations "
-        f"(e.g. bloods, imaging, ECG), treatments, and specialist involvement."
-    )
-    return context
+    return registry.get_clinical_context(CODE_SYSTEM, code)
 
 
 def infer_specialty(code: str) -> str:
@@ -602,39 +627,7 @@ def infer_specialty(code: str) -> str:
 
     Falls back to a chapter-based heuristic if the code is not in the dictionary.
     """
-    info = lookup_code(code)
-    if info:
-        return info["specialty"]
-
-    code = code.strip().upper()
-    if not code:
-        return "General Medicine"
-
-    chapter_letter = code[0]
-    chapter_map = {
-        "A": "Infectious Diseases",
-        "B": "Infectious Diseases",
-        "C": "Oncology",
-        "D": "Haematology",
-        "E": "Endocrinology",
-        "F": "Psychiatry",
-        "G": "Neurology",
-        "H": "Ophthalmology / ENT",
-        "I": "Cardiology",
-        "J": "Respiratory Medicine",
-        "K": "Gastroenterology / General Surgery",
-        "L": "Dermatology",
-        "M": "Rheumatology / Orthopaedics",
-        "N": "Nephrology / Urology",
-        "O": "Obstetrics",
-        "P": "Paediatrics / Neonatology",
-        "Q": "Genetics / Paediatrics",
-        "R": "Emergency Medicine",
-        "S": "Trauma and Orthopaedics",
-        "T": "Emergency Medicine",
-        "Z": "General Medicine",
-    }
-    return chapter_map.get(chapter_letter, "General Medicine")
+    return registry.infer_specialty(CODE_SYSTEM, code)
 
 
 def parse_codes(codes_str: str) -> list[str]:
@@ -648,7 +641,4 @@ def parse_codes(codes_str: str) -> list[str]:
     Returns:
         List of uppercased code strings, e.g. ["I21.0", "J18.1", "K35.2"]
     """
-    if not codes_str or not codes_str.strip():
-        return []
-    parts = [c.strip().upper() for c in codes_str.split(",")]
-    return [p for p in parts if p]
+    return registry.parse_codes(codes_str)

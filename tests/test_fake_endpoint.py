@@ -132,8 +132,8 @@ class TestFakeEndpointGenerateFromCodes:
         fake_llm_endpoint.set_response(respond)
 
         admission = processing.generate_from_codes(
-            icd10_codes=[code],
-            opcs4_codes=[],
+            diagnostic_codes=[code],
+            procedure_codes=[],
             patient_details=sample_patient,
             admission_date="2026-07-08",
             admission_time="09:00",
@@ -142,7 +142,7 @@ class TestFakeEndpointGenerateFromCodes:
 
         # Backward check: the fake endpoint's response is correctly parsed
         # and the diagnosis carried through into the admission record.
-        assert admission["icd10_codes"] == [code]
+        assert admission["diagnostic_codes"] == [code]
         assert code in admission["working_diagnosis"]
 
         # Forward check: the code was actually part of the outbound request.
@@ -165,15 +165,15 @@ class TestFakeEndpointGenerateFromCodes:
         fake_llm_endpoint.set_response(respond)
 
         admission = processing.generate_from_codes(
-            icd10_codes=[],
-            opcs4_codes=[code],
+            diagnostic_codes=[],
+            procedure_codes=[code],
             patient_details=sample_patient,
             admission_date="2026-07-08",
             admission_time="09:00",
             model="fake-model",
         )
 
-        assert admission["opcs4_codes"] == [code]
+        assert admission["procedure_codes"] == [code]
         assert code in admission["indication"]
 
         sent_prompt = fake_llm_endpoint.requests_received[0]["messages"][-1]["content"]

@@ -54,7 +54,8 @@ class TestGetClinicalContext:
     def test_unknown_code_context_still_contains_code(self):
         context = opcs4.get_clinical_context("ZZ99.9")
         assert "ZZ99.9" in context
-        assert "OPCS-4 surgical/interventional procedure code" in context
+        assert "not found" in context.lower()
+        assert "procedure code" in context.lower()
 
 
 class TestInferSpecialty:

@@ -5,9 +5,17 @@ OPCS-4 (Office of Population Censuses and Surveys Classification of Intervention
 and Procedures, version 4) is the UK classification of surgical and interventional
 procedures. Codes follow the format: letter + 2 digits + optional decimal + digit,
 e.g. K40.1, W37.1, H01.1.
+
+This module builds a src.codes.registry.CodeSystem from OPCS4_CODES and
+registers it under the key 'opcs4'. The functions below are thin wrappers
+around the generic registry implementation, kept for convenience and
+backward compatibility - equivalent behaviour is available for any
+registered code system via src.codes.registry directly.
 """
 
 from __future__ import annotations
+
+from src.codes import registry
 
 # ---------------------------------------------------------------------------
 # Curated OPCS-4 code dictionary
@@ -446,6 +454,49 @@ OPCS4_CODES: dict[str, dict] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Chapter-letter fallback surgical specialty map, used for codes outside
+# OPCS4_CODES
+# ---------------------------------------------------------------------------
+_CHAPTER_SPECIALTY_MAP: dict[str, str] = {
+    "A": "Neurosurgery",
+    "B": "Endocrine Surgery",
+    "C": "Ophthalmology",
+    "D": "Ear, Nose and Throat Surgery",
+    "E": "Cardiothoracic Surgery",
+    "F": "Oral and Maxillofacial Surgery",
+    "G": "Upper GI Surgery",
+    "H": "Colorectal Surgery",
+    "J": "General Surgery",
+    "K": "Cardiac Surgery",
+    "L": "Vascular Surgery",
+    "M": "Urology",
+    "N": "Urology",
+    "O": "Obstetrics",
+    "P": "Urology",
+    "Q": "Gynaecology",
+    "S": "Breast Surgery",
+    "T": "Plastic Surgery",
+    "V": "Trauma and Orthopaedics",
+    "W": "Trauma and Orthopaedics",
+    "X": "Radiology",
+    "Y": "Surgery",
+    "Z": "Surgery",
+}
+
+CODE_SYSTEM = registry.CodeSystem(
+    key="opcs4",
+    name="OPCS-4",
+    kind="procedure",
+    codes=OPCS4_CODES,
+    specialty_field="surgical_specialty",
+    type_field="elective_or_emergency",
+    chapter_map=_CHAPTER_SPECIALTY_MAP,
+    default_specialty="General Surgery",
+)
+registry.register_code_system(CODE_SYSTEM)
+
+
 def lookup_code(code: str) -> dict | None:
     """Return the metadata dict for a given OPCS-4 code, or None if not found.
 
@@ -458,10 +509,7 @@ def lookup_code(code: str) -> dict | None:
         Dictionary with keys description, chapter_name, surgical_specialty,
         elective_or_emergency, typical_los_days, or None.
     """
-    if not code:
-        return None
-    normalised = code.strip().upper()
-    return OPCS4_CODES.get(normalised)
+    return registry.lookup_code(CODE_SYSTEM, code)
 
 
 def get_clinical_context(code: str) -> str:
@@ -474,35 +522,7 @@ def get_clinical_context(code: str) -> str:
         A formatted string describing the surgical/procedural context, or a
         generic message if the code is not found.
     """
-    code_upper = code.strip().upper()
-    info = lookup_code(code_upper)
-    if info is None:
-        return (
-            f"OPCS-4 {code_upper}: This is an OPCS-4 surgical/interventional procedure code. "
-            f"Please generate clinically appropriate NHS patient journey documentation for "
-            f"this procedure, following standard UK surgical practice and NHS documentation "
-            f"conventions including pre-operative assessment, consent, and post-operative care."
-        )
-
-    los_low, los_high = info["typical_los_days"]
-    proc_type = info["elective_or_emergency"]
-    proc_article = "an" if proc_type[0] in "aeiou" else "a"
-
-    if los_high == 0 or (los_low == 0 and los_high <= 1):
-        los_desc = "day case (no overnight stay)"
-    else:
-        los_desc = f"{los_low}–{los_high} days"
-
-    return (
-        f"OPCS-4 {code_upper} ({info['description']}): This patient is undergoing "
-        f"{proc_article} {proc_type} procedure. "
-        f"Chapter: {info['chapter_name']}. "
-        f"Surgical specialty: {info['surgical_specialty']}. "
-        f"Typical length of stay: {los_desc}. "
-        f"Ensure clinical documentation includes appropriate pre-operative assessment "
-        f"(fitness for anaesthesia, consent, WHO surgical checklist), intra-operative "
-        f"findings, and post-operative care plan as per NHS surgical pathway standards."
-    )
+    return registry.get_clinical_context(CODE_SYSTEM, code)
 
 
 def infer_specialty(code: str) -> str:
@@ -516,41 +536,7 @@ def infer_specialty(code: str) -> str:
     Returns:
         Surgical specialty string.
     """
-    info = lookup_code(code)
-    if info:
-        # Return primary specialty (before any '/')
-        return info["surgical_specialty"].split("/")[0].strip()
-
-    if not code:
-        return "General Surgery"
-
-    chapter = code.strip().upper()[0]
-    chapter_map: dict[str, str] = {
-        "A": "Neurosurgery",
-        "B": "Endocrine Surgery",
-        "C": "Ophthalmology",
-        "D": "Ear, Nose and Throat Surgery",
-        "E": "Cardiothoracic Surgery",
-        "F": "Oral and Maxillofacial Surgery",
-        "G": "Upper GI Surgery",
-        "H": "Colorectal Surgery",
-        "J": "General Surgery",
-        "K": "Cardiac Surgery",
-        "L": "Vascular Surgery",
-        "M": "Urology",
-        "N": "Urology",
-        "O": "Obstetrics",
-        "P": "Urology",
-        "Q": "Gynaecology",
-        "S": "Breast Surgery",
-        "T": "Plastic Surgery",
-        "V": "Trauma and Orthopaedics",
-        "W": "Trauma and Orthopaedics",
-        "X": "Radiology",
-        "Y": "Surgery",
-        "Z": "Surgery",
-    }
-    return chapter_map.get(chapter, "General Surgery")
+    return registry.infer_specialty(CODE_SYSTEM, code)
 
 
 def parse_codes(codes_str: str) -> list[str]:
@@ -564,6 +550,4 @@ def parse_codes(codes_str: str) -> list[str]:
     Returns:
         List of normalised (upper-case, stripped) code strings.
     """
-    if not codes_str or not codes_str.strip():
-        return []
-    return [c.strip().upper() for c in codes_str.split(",") if c.strip()]
+    return registry.parse_codes(codes_str)

@@ -727,6 +727,7 @@ def build_output_info(
     admissions: list[dict],
     journeys: list[list[dict]],
     clinical_notes: list[list[dict]],
+    code_reflection_reports: list[dict] | None = None,
 ) -> dict[str, Any]:
     """Build a summary info dict for a completed generation run.
 
@@ -735,6 +736,10 @@ def build_output_info(
         admissions: List of generated admission dicts.
         journeys: List of lists of journey event dicts.
         clinical_notes: List of lists of clinical note dicts.
+        code_reflection_reports: Optional list of per-patient backward-pass
+            reflection reports (see check_code_reflected /
+            main.step_verify_code_reflection), one dict per patient mapping
+            code -> {'patient':..., 'admission':..., 'journey':..., 'notes':...}.
 
     Returns:
         Summary statistics dict.
@@ -748,7 +753,7 @@ def build_output_info(
             nt = note.get("note_type", "unknown")
             note_types[nt] = note_types.get(nt, 0) + 1
 
-    return {
+    summary: dict[str, Any] = {
         "n_patients": len(patients),
         "n_admissions": len(admissions),
         "n_journey_events": total_events,
@@ -758,6 +763,25 @@ def build_output_info(
         "note_type_distribution": note_types,
         "generation_timestamp": datetime.utcnow().isoformat(),
     }
+
+    if code_reflection_reports:
+        total_codes = 0
+        reflected_codes = 0
+        unreflected_codes: list[str] = []
+        for report in code_reflection_reports:
+            for code, result in report.items():
+                total_codes += 1
+                if result["admission"] or result["notes"]:
+                    reflected_codes += 1
+                else:
+                    unreflected_codes.append(code)
+        summary["code_reflection_check"] = {
+            "n_codes_checked": total_codes,
+            "n_codes_reflected": reflected_codes,
+            "unreflected_codes": unreflected_codes,
+        }
+
+    return summary
 
 
 # ---------------------------------------------------------------------------
@@ -860,97 +884,70 @@ def read_write_data(
 
 
 def generate_from_codes(
-    icd10_codes: list[str],
-    opcs4_codes: list[str],
+    diagnostic_codes: list[str],
+    procedure_codes: list[str],
     patient_details: dict,
     admission_date: str,
     admission_time: str,
     model: str | None = None,
+    diagnostic_code_system: str = "icd10",
+    procedure_code_system: str = "opcs4",
 ) -> dict:
-    """Generate an admission record driven by ICD-10 and/or OPCS-4 codes.
+    """Generate an admission record driven by diagnostic and/or procedure codes.
 
-    Selects the most appropriate prompt based on which codes are provided:
-    - ICD-10 only -> icd10_admission_prompt
-    - OPCS-4 only -> opcs4_admission_prompt
-    - Both -> multi_code_admission_prompt
-    - Neither -> emergency_admission_prompt with random diagnosis
+    Works with any registered code system (see src/codes/registry.py), not
+    just ICD-10/OPCS-4 - diagnostic_code_system and procedure_code_system
+    select which registered CodeSystem the codes belong to. Built-in
+    systems are 'icd10' (diagnostic) and 'opcs4' (procedure); additional
+    standards (ICD-11, SNOMED CT, CPT, etc.) can be added by registering a
+    new CodeSystem, with no changes required here.
+
+    If neither diagnostic_codes nor procedure_codes are given, falls back
+    to a generic emergency admission prompt with a random presentation.
 
     Args:
-        icd10_codes: List of ICD-10 codes (may be empty).
-        opcs4_codes: List of OPCS-4 codes (may be empty).
+        diagnostic_codes: List of diagnostic codes (may be empty).
+        procedure_codes: List of procedure codes (may be empty).
         patient_details: Dict of patient demographics.
         admission_date: ISO date string (YYYY-MM-DD).
         admission_time: HH:MM time string.
         model: Optional model override.
+        diagnostic_code_system: Registry key for the diagnostic code system
+            the codes belong to (default 'icd10').
+        procedure_code_system: Registry key for the procedure code system
+            the codes belong to (default 'opcs4').
 
     Returns:
-        Dict containing generated admission data. Keys depend on prompt used.
+        Dict containing generated admission data, enriched with
+        diagnostic_codes/procedure_codes and the code system keys used.
     """
-    from src.codes.icd10 import get_clinical_context as icd10_context  # noqa: PLC0415
-    from src.codes.opcs4 import get_clinical_context as opcs4_context  # noqa: PLC0415
+    from src.codes import registry  # noqa: PLC0415
     from src.prompts import patient_prompts  # noqa: PLC0415
 
     patient_str = json.dumps(clean_patient_details(patient_details), indent=2)
 
-    has_icd10 = bool(icd10_codes)
-    has_opcs4 = bool(opcs4_codes)
+    if diagnostic_codes or procedure_codes:
+        diag_system = registry.get_code_system(diagnostic_code_system)
+        proc_system = registry.get_code_system(procedure_code_system)
 
-    if has_icd10 and has_opcs4:
-        # Multi-code path
-        diagnoses_parts = []
-        for code in icd10_codes:
-            diagnoses_parts.append(icd10_context(code))
-        diagnoses_str = "\n".join(diagnoses_parts)
+        diagnoses_str = (
+            "\n".join(registry.get_clinical_context(diag_system, c) for c in diagnostic_codes)
+            or "None specified."
+        )
+        procedures_str = (
+            "\n".join(registry.get_clinical_context(proc_system, c) for c in procedure_codes)
+            or "None specified."
+        )
 
-        procedures_parts = []
-        for code in opcs4_codes:
-            procedures_parts.append(opcs4_context(code))
-        procedures_str = "\n".join(procedures_parts)
-
-        prompt = patient_prompts["multi_code_admission_prompt"].substitute(
+        prompt = patient_prompts["code_driven_admission_prompt"].substitute(
             PATIENT_DETAILS=patient_str,
+            DIAGNOSTIC_CODE_SYSTEM=diag_system.name,
             DIAGNOSES_CONTEXT=diagnoses_str,
+            PROCEDURE_CODE_SYSTEM=proc_system.name,
             PROCEDURES_CONTEXT=procedures_str,
             ADMISSION_DATE=admission_date,
             ADMISSION_TIME=admission_time,
         )
-
-    elif has_icd10:
-        # ICD-10 only
-        primary_code = icd10_codes[0]
-        from src.codes.icd10 import lookup_code as icd10_lookup  # noqa: PLC0415
-
-        info = icd10_lookup(primary_code) or {}
-        description = info.get("description", f"ICD-10 {primary_code}")
-        context = icd10_context(primary_code)
-
-        prompt = patient_prompts["icd10_admission_prompt"].substitute(
-            PATIENT_DETAILS=patient_str,
-            ICD10_CODE=primary_code,
-            ICD10_DESCRIPTION=description,
-            ICD10_CONTEXT=context,
-            ADMISSION_DATE=admission_date,
-            ADMISSION_TIME=admission_time,
-        )
-
-    elif has_opcs4:
-        # OPCS-4 only
-        primary_code = opcs4_codes[0]
-        from src.codes.opcs4 import lookup_code as opcs4_lookup  # noqa: PLC0415
-
-        info = opcs4_lookup(primary_code) or {}
-        description = info.get("description", f"OPCS-4 {primary_code}")
-        context = opcs4_context(primary_code)
-
-        prompt = patient_prompts["opcs4_admission_prompt"].substitute(
-            PATIENT_DETAILS=patient_str,
-            OPCS4_CODE=primary_code,
-            OPCS4_DESCRIPTION=description,
-            OPCS4_CONTEXT=context,
-            ADMISSION_DATE=admission_date,
-            ADMISSION_TIME=admission_time,
-        )
-
     else:
         # No codes provided: use a generic emergency admission prompt
         prompt = patient_prompts["emergency_admission_prompt"].substitute(
@@ -971,21 +968,31 @@ def generate_from_codes(
         logger.warning("Failed to parse admission JSON: %s", exc)
         admission_data = {
             "raw_response": response,
-            "icd10_codes": icd10_codes,
-            "opcs4_codes": opcs4_codes,
             "admission_date": admission_date,
             "parse_error": str(exc),
         }
 
     # Enrich with code metadata
-    admission_data["icd10_codes"] = icd10_codes
-    admission_data["opcs4_codes"] = opcs4_codes
+    admission_data["diagnostic_codes"] = diagnostic_codes
+    admission_data["diagnostic_code_system"] = diagnostic_code_system if diagnostic_codes else None
+    admission_data["procedure_codes"] = procedure_codes
+    admission_data["procedure_code_system"] = procedure_code_system if procedure_codes else None
     return admission_data
 
 
 # ---------------------------------------------------------------------------
 # Diagnosis reflection check (backward pass)
 # ---------------------------------------------------------------------------
+
+
+# Bookkeeping fields generate_from_codes mechanically attaches to every
+# admission record. Excluded from the "admission" reflection check below,
+# otherwise the check would trivially pass on these alone - the point is to
+# confirm the code made it into the *clinical narrative*, not just that it
+# was echoed back as metadata.
+_ADMISSION_CODE_BOOKKEEPING_FIELDS = frozenset(
+    {"diagnostic_codes", "diagnostic_code_system", "procedure_codes", "procedure_code_system"}
+)
 
 
 def _check_code_reflected(
@@ -1004,12 +1011,54 @@ def _check_code_reflected(
         haystack = json.dumps(part, default=str).lower()
         return any(needle in haystack for needle in needles)
 
+    admission_narrative = {
+        k: v for k, v in admission.items() if k not in _ADMISSION_CODE_BOOKKEEPING_FIELDS
+    }
+
     return {
         "patient": _contains(patient),
-        "admission": _contains(admission),
+        "admission": _contains(admission_narrative),
         "journey": _contains(journey),
         "notes": _contains(notes),
     }
+
+
+def check_code_reflected(
+    code: str,
+    code_system: str,
+    patient: dict,
+    admission: dict,
+    journey: list[dict],
+    notes: list[dict],
+) -> dict[str, bool]:
+    """Backward-pass check for a code from any registered system.
+
+    The forward pass looks up a code (see generate_from_codes) and pushes
+    its description into the generation prompts. This is the matching
+    backward pass: given the generated patient, admission, journey, and
+    notes, confirm the code actually made it into each part's text content.
+    Works for any code system registered in src/codes/registry.py, not just
+    ICD-10/OPCS-4.
+
+    Args:
+        code: Code to search for (e.g. 'I21.0').
+        code_system: Registry key of the code system the code belongs to
+            (e.g. 'icd10', 'opcs4').
+        patient: Generated patient dict.
+        admission: Generated admission dict.
+        journey: Generated list of journey event dicts.
+        notes: Generated list of clinical note dicts.
+
+    Returns:
+        Dict with keys 'patient', 'admission', 'journey', 'notes', each True
+        if the code or a keyword from its description appears in that part.
+    """
+    from src.codes import registry  # noqa: PLC0415
+
+    system = registry.get_code_system(code_system)
+    info = registry.lookup_code(system, code)
+    description = info["description"] if info else ""
+    return _check_code_reflected(code, description, patient, admission, journey, notes)
 
 
 def check_diagnosis_reflected(
@@ -1018,30 +1067,27 @@ def check_diagnosis_reflected(
     admission: dict,
     journey: list[dict],
     notes: list[dict],
+    code_system: str = "icd10",
 ) -> dict[str, bool]:
-    """Backward-pass check for an ICD-10 diagnosis across generated output.
+    """Backward-pass check for a diagnosis across generated output.
 
-    The forward pass looks up an ICD-10 code and pushes its description into
-    the generation prompts (see generate_from_codes). This is the matching
-    backward pass: given the generated patient, admission, journey, and notes,
-    confirm the diagnosis actually made it into each part's text content.
+    Convenience wrapper around check_code_reflected, defaulting to ICD-10.
+    Pass code_system to check a diagnosis from a different registered
+    diagnostic standard (e.g. 'icd11', 'snomed-ct').
 
     Args:
-        icd10_code: ICD-10 code to search for (e.g. 'I21.0').
+        icd10_code: Diagnostic code to search for (e.g. 'I21.0').
         patient: Generated patient dict.
         admission: Generated admission dict.
         journey: Generated list of journey event dicts.
         notes: Generated list of clinical note dicts.
+        code_system: Registry key of the diagnostic code system (default 'icd10').
 
     Returns:
         Dict with keys 'patient', 'admission', 'journey', 'notes', each True
         if the code or a keyword from its description appears in that part.
     """
-    from src.codes.icd10 import lookup_code  # noqa: PLC0415
-
-    info = lookup_code(icd10_code)
-    description = info["description"] if info else ""
-    return _check_code_reflected(icd10_code, description, patient, admission, journey, notes)
+    return check_code_reflected(icd10_code, code_system, patient, admission, journey, notes)
 
 
 def check_procedure_reflected(
@@ -1050,28 +1096,27 @@ def check_procedure_reflected(
     admission: dict,
     journey: list[dict],
     notes: list[dict],
+    code_system: str = "opcs4",
 ) -> dict[str, bool]:
-    """Backward-pass check for an OPCS-4 procedure across generated output.
+    """Backward-pass check for a procedure across generated output.
 
-    Mirrors check_diagnosis_reflected for procedure (rather than diagnosis)
-    codes - see that function for the shared rationale.
+    Convenience wrapper around check_code_reflected, defaulting to OPCS-4.
+    Pass code_system to check a procedure from a different registered
+    procedure standard (e.g. 'cpt', 'hcpcs').
 
     Args:
-        opcs4_code: OPCS-4 code to search for (e.g. 'K40.1').
+        opcs4_code: Procedure code to search for (e.g. 'K40.1').
         patient: Generated patient dict.
         admission: Generated admission dict.
         journey: Generated list of journey event dicts.
         notes: Generated list of clinical note dicts.
+        code_system: Registry key of the procedure code system (default 'opcs4').
 
     Returns:
         Dict with keys 'patient', 'admission', 'journey', 'notes', each True
         if the code or a keyword from its description appears in that part.
     """
-    from src.codes.opcs4 import lookup_code  # noqa: PLC0415
-
-    info = lookup_code(opcs4_code)
-    description = info["description"] if info else ""
-    return _check_code_reflected(opcs4_code, description, patient, admission, journey, notes)
+    return check_code_reflected(opcs4_code, code_system, patient, admission, journey, notes)
 
 
 # ---------------------------------------------------------------------------

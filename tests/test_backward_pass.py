@@ -139,8 +139,8 @@ class TestForwardAndBackwardPassIntegration:
         monkeypatch.setattr(processing, "call_llm", fake_call_llm)
 
         admission = processing.generate_from_codes(
-            icd10_codes=[code],
-            opcs4_codes=[],
+            diagnostic_codes=[code],
+            procedure_codes=[],
             patient_details=sample_patient,
             admission_date="2026-07-08",
             admission_time="10:00",
@@ -205,8 +205,8 @@ class TestForwardAndBackwardPassIntegration:
         monkeypatch.setattr(processing, "call_llm", fake_call_llm)
 
         admission = processing.generate_from_codes(
-            icd10_codes=[],
-            opcs4_codes=[code],
+            diagnostic_codes=[],
+            procedure_codes=[code],
             patient_details=sample_patient,
             admission_date="2026-07-08",
             admission_time="08:00",

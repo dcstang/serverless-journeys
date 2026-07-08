@@ -1,9 +1,13 @@
-"""Forward-pass tests: ICD-10 codes are looked up and pushed into the
-generation prompts (admission -> journey -> notes) before any LLM call.
+"""Forward-pass tests: diagnostic/procedure codes are looked up and pushed
+into the generation prompts (admission -> journey -> notes) before any LLM
+call.
 
 Every test here mocks src.processing.call_llm and asserts on the *prompt
 text actually sent*, not just the function's return value - this is what
-proves the codes are "sent through" rather than silently dropped.
+proves the codes are "sent through" rather than silently dropped. Uses the
+built-in ICD-10 ('icd10') and OPCS-4 ('opcs4') registered code systems, but
+generate_from_codes itself is system-agnostic - see test_code_registry.py
+for coverage of a third, made-up code system.
 """
 
 from __future__ import annotations
@@ -14,7 +18,7 @@ from src import processing
 from src.codes import icd10, opcs4
 
 
-class TestForwardPassSingleIcd10Code:
+class TestForwardPassSingleDiagnosticCode:
     def test_code_and_description_are_injected_into_prompt(self, monkeypatch, sample_patient):
         captured = {}
 
@@ -25,8 +29,8 @@ class TestForwardPassSingleIcd10Code:
         monkeypatch.setattr(processing, "call_llm", fake_call_llm)
 
         processing.generate_from_codes(
-            icd10_codes=["I21.0"],
-            opcs4_codes=[],
+            diagnostic_codes=["I21.0"],
+            procedure_codes=[],
             patient_details=sample_patient,
             admission_date="2026-07-08",
             admission_time="09:00",
@@ -36,7 +40,7 @@ class TestForwardPassSingleIcd10Code:
         assert "I21.0" in prompt
         assert "Acute transmural myocardial infarction of anterior wall (STEMI)" in prompt
 
-    def test_admission_dict_carries_input_codes_forward(self, monkeypatch, sample_patient):
+    def test_admission_dict_carries_input_codes_and_system_forward(self, monkeypatch, sample_patient):
         monkeypatch.setattr(
             processing,
             "call_llm",
@@ -44,15 +48,17 @@ class TestForwardPassSingleIcd10Code:
         )
 
         admission = processing.generate_from_codes(
-            icd10_codes=["I21.0"],
-            opcs4_codes=[],
+            diagnostic_codes=["I21.0"],
+            procedure_codes=[],
             patient_details=sample_patient,
             admission_date="2026-07-08",
             admission_time="09:00",
         )
 
-        assert admission["icd10_codes"] == ["I21.0"]
-        assert admission["opcs4_codes"] == []
+        assert admission["diagnostic_codes"] == ["I21.0"]
+        assert admission["diagnostic_code_system"] == "icd10"
+        assert admission["procedure_codes"] == []
+        assert admission["procedure_code_system"] is None
 
     def test_unparseable_llm_response_still_carries_codes_forward(self, monkeypatch, sample_patient):
         monkeypatch.setattr(
@@ -62,19 +68,19 @@ class TestForwardPassSingleIcd10Code:
         )
 
         admission = processing.generate_from_codes(
-            icd10_codes=["I21.0", "J18.1"],
-            opcs4_codes=[],
+            diagnostic_codes=["I21.0", "J18.1"],
+            procedure_codes=[],
             patient_details=sample_patient,
             admission_date="2026-07-08",
             admission_time="09:00",
         )
 
-        assert admission["icd10_codes"] == ["I21.0", "J18.1"]
+        assert admission["diagnostic_codes"] == ["I21.0", "J18.1"]
         assert "parse_error" in admission
 
 
 class TestForwardPassMultiCode:
-    def test_all_icd10_and_opcs4_codes_appear_in_prompt(self, monkeypatch, sample_patient):
+    def test_all_diagnostic_and_procedure_codes_appear_in_prompt(self, monkeypatch, sample_patient):
         captured = {}
 
         def fake_call_llm(prompt, model=None, temp=0.7, **kwargs):
@@ -84,8 +90,8 @@ class TestForwardPassMultiCode:
         monkeypatch.setattr(processing, "call_llm", fake_call_llm)
 
         processing.generate_from_codes(
-            icd10_codes=["I21.0", "J18.1"],
-            opcs4_codes=["K40.1"],
+            diagnostic_codes=["I21.0", "J18.1"],
+            procedure_codes=["K40.1"],
             patient_details=sample_patient,
             admission_date="2026-07-08",
             admission_time="09:00",
@@ -95,6 +101,9 @@ class TestForwardPassMultiCode:
         assert "I21.0" in prompt
         assert "J18.1" in prompt
         assert "K40.1" in prompt
+        # System names must be identified explicitly, not assumed.
+        assert "ICD-10" in prompt
+        assert "OPCS-4" in prompt
 
     def test_unknown_code_is_still_sent_through(self, monkeypatch, sample_patient):
         """Even codes absent from the curated dictionary must reach the prompt."""
@@ -109,21 +118,21 @@ class TestForwardPassMultiCode:
         assert icd10.lookup_code("ZZ99.9") is None  # sanity check: genuinely unknown
 
         admission = processing.generate_from_codes(
-            icd10_codes=["ZZ99.9"],
-            opcs4_codes=[],
+            diagnostic_codes=["ZZ99.9"],
+            procedure_codes=[],
             patient_details=sample_patient,
             admission_date="2026-07-08",
             admission_time="09:00",
         )
 
         assert "ZZ99.9" in captured["prompt"]
-        assert admission["icd10_codes"] == ["ZZ99.9"]
+        assert admission["diagnostic_codes"] == ["ZZ99.9"]
 
 
-class TestForwardPassOpcs4Only:
-    """The opcs4-only branch of generate_from_codes uses a separate prompt
-    template (opcs4_admission_prompt) from the ICD-10 path, so it needs its
-    own forward-pass coverage rather than piggybacking on the ICD-10 tests."""
+class TestForwardPassProcedureOnly:
+    """The procedure-only path exercises generate_from_codes with an empty
+    diagnostic_codes list, so it needs its own forward-pass coverage rather
+    than piggybacking on the diagnostic-code tests."""
 
     def test_code_and_description_are_injected_into_prompt(self, monkeypatch, sample_patient):
         captured = {}
@@ -135,8 +144,8 @@ class TestForwardPassOpcs4Only:
         monkeypatch.setattr(processing, "call_llm", fake_call_llm)
 
         processing.generate_from_codes(
-            icd10_codes=[],
-            opcs4_codes=["K40.1"],
+            diagnostic_codes=[],
+            procedure_codes=["K40.1"],
             patient_details=sample_patient,
             admission_date="2026-07-08",
             admission_time="09:00",
@@ -146,7 +155,7 @@ class TestForwardPassOpcs4Only:
         assert "K40.1" in prompt
         assert "Coronary artery bypass grafting using saphenous vein graft" in prompt
 
-    def test_admission_dict_carries_input_codes_forward(self, monkeypatch, sample_patient):
+    def test_admission_dict_carries_input_codes_and_system_forward(self, monkeypatch, sample_patient):
         monkeypatch.setattr(
             processing,
             "call_llm",
@@ -154,17 +163,19 @@ class TestForwardPassOpcs4Only:
         )
 
         admission = processing.generate_from_codes(
-            icd10_codes=[],
-            opcs4_codes=["K40.1"],
+            diagnostic_codes=[],
+            procedure_codes=["K40.1"],
             patient_details=sample_patient,
             admission_date="2026-07-08",
             admission_time="09:00",
         )
 
-        assert admission["opcs4_codes"] == ["K40.1"]
-        assert admission["icd10_codes"] == []
+        assert admission["procedure_codes"] == ["K40.1"]
+        assert admission["procedure_code_system"] == "opcs4"
+        assert admission["diagnostic_codes"] == []
+        assert admission["diagnostic_code_system"] is None
 
-    def test_unknown_opcs4_code_is_still_sent_through(self, monkeypatch, sample_patient):
+    def test_unknown_procedure_code_is_still_sent_through(self, monkeypatch, sample_patient):
         captured = {}
 
         def fake_call_llm(prompt, model=None, temp=0.7, **kwargs):
@@ -176,15 +187,15 @@ class TestForwardPassOpcs4Only:
         assert opcs4.lookup_code("ZZ99.9") is None  # sanity check: genuinely unknown
 
         admission = processing.generate_from_codes(
-            icd10_codes=[],
-            opcs4_codes=["ZZ99.9"],
+            diagnostic_codes=[],
+            procedure_codes=["ZZ99.9"],
             patient_details=sample_patient,
             admission_date="2026-07-08",
             admission_time="09:00",
         )
 
         assert "ZZ99.9" in captured["prompt"]
-        assert admission["opcs4_codes"] == ["ZZ99.9"]
+        assert admission["procedure_codes"] == ["ZZ99.9"]
 
 
 class TestForwardPassPropagatesIntoJourneyAndNotes:
@@ -199,7 +210,7 @@ class TestForwardPassPropagatesIntoJourneyAndNotes:
 
         monkeypatch.setattr(processing, "call_llm", fake_call_llm)
 
-        admission = {"icd10_codes": ["I21.0"], "working_diagnosis": "I21.0 - STEMI"}
+        admission = {"diagnostic_codes": ["I21.0"], "working_diagnosis": "I21.0 - STEMI"}
 
         processing.generate_journey(
             patient=sample_patient,
@@ -220,7 +231,7 @@ class TestForwardPassPropagatesIntoJourneyAndNotes:
 
         monkeypatch.setattr(processing, "call_llm", fake_call_llm)
 
-        admission = {"icd10_codes": ["I21.0"], "working_diagnosis": "I21.0 - STEMI"}
+        admission = {"diagnostic_codes": ["I21.0"], "working_diagnosis": "I21.0 - STEMI"}
         event = {"event_type": "ED event", "event_date": "2026-07-08", "event_time": "09:00"}
 
         processing.generate_clinical_note(

@@ -2,29 +2,34 @@
 main.py - CLI entrypoint for serverless-journeys Nebius serverless job.
 
 Generates synthetic NHS patient journeys with clinical notes, driven by
-ICD-10 diagnosis codes and/or OPCS-4 procedure codes.
+diagnostic codes and/or procedure codes from any registered coding
+standard (see src/codes/registry.py). Defaults to ICD-10 for diagnoses and
+OPCS-4 for procedures, but --diagnostic-code-system / --procedure-code-system
+can select any other registered system (e.g. ICD-11, SNOMED CT, CPT).
 
 Usage:
-    python main.py [--icd10-codes I21.0,J18.1] [--opcs4-codes K40.1] \\
+    python main.py [--diagnostic-codes I21.0,J18.1] [--procedure-codes K40.1] \\
                    [--n-patients 5] [--output-dir data/output] \\
                    [--model claude-sonnet-4-6] [--llm-provider anthropic]
 
     # Run against a Nebius serverless GPU endpoint instead:
     python main.py --llm-provider nebius \\
                    --model meta-llama/Meta-Llama-3.1-70B-Instruct-fast \\
-                   --icd10-codes I21.0 --n-patients 10
+                   --diagnostic-codes I21.0 --n-patients 10
 
 Environment variables (override CLI args or provide defaults):
-    ANTHROPIC_API_KEY  - required for anthropic provider
-    OPENAI_API_KEY     - required for openai provider
-    NEBIUS_API_KEY     - required for nebius provider
-    NEBIUS_BASE_URL    - Nebius endpoint (default: https://api.studio.nebius.com/v1/)
-    LLM_PROVIDER       - 'anthropic', 'openai', or 'nebius'
-    MODEL              - model identifier (e.g. any model id on your Nebius endpoint)
-    N_PATIENTS         - number of patients to generate
-    ICD10_CODES        - comma-separated ICD-10 codes
-    OPCS4_CODES        - comma-separated OPCS-4 codes
-    OUTPUT_DIR         - output directory path
+    ANTHROPIC_API_KEY      - required for anthropic provider
+    OPENAI_API_KEY         - required for openai provider
+    NEBIUS_API_KEY         - required for nebius provider
+    NEBIUS_BASE_URL        - Nebius endpoint (default: https://api.studio.nebius.com/v1/)
+    LLM_PROVIDER           - 'anthropic', 'openai', or 'nebius'
+    MODEL                  - model identifier (e.g. any model id on your Nebius endpoint)
+    N_PATIENTS             - number of patients to generate
+    DIAGNOSTIC_CODES       - comma-separated diagnostic codes (legacy: ICD10_CODES)
+    DIAGNOSTIC_CODE_SYSTEM - diagnostic coding standard, default 'icd10'
+    PROCEDURE_CODES        - comma-separated procedure codes (legacy: OPCS4_CODES)
+    PROCEDURE_CODE_SYSTEM  - procedure coding standard, default 'opcs4'
+    OUTPUT_DIR             - output directory path
 """
 
 from __future__ import annotations
@@ -75,8 +80,12 @@ def _import_project_modules():
         modules["params"] = importlib.import_module("config.params")
         modules["config"] = importlib.import_module("config.config")
         modules["processing"] = importlib.import_module("src.processing")
+        # Importing icd10/opcs4 registers them as CodeSystems (see
+        # src/codes/registry.py) - keep these imports even though this
+        # module mostly talks to the generic registry from here on.
         modules["icd10"] = importlib.import_module("src.codes.icd10")
         modules["opcs4"] = importlib.import_module("src.codes.opcs4")
+        modules["registry"] = importlib.import_module("src.codes.registry")
         modules["doc_templates"] = importlib.import_module("src.doc_templates")
     except ImportError as exc:
         logger.error("Failed to import project modules: %s", exc)
@@ -110,23 +119,51 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--icd10-codes",
+        "--diagnostic-codes",
         type=str,
-        default=os.environ.get("ICD10_CODES", ""),
+        default=os.environ.get("DIAGNOSTIC_CODES", os.environ.get("ICD10_CODES", "")),
         help=(
-            "Comma-separated ICD-10 codes to drive admission generation "
-            "(e.g. 'I21.0,J18.1'). Overrides ICD10_CODES env var."
+            "Comma-separated diagnostic codes to drive admission generation "
+            "(e.g. 'I21.0,J18.1'). Overrides DIAGNOSTIC_CODES (or legacy "
+            "ICD10_CODES) env var. Interpreted under --diagnostic-code-system."
         ),
     )
     parser.add_argument(
-        "--opcs4-codes",
+        "--diagnostic-code-system",
         type=str,
-        default=os.environ.get("OPCS4_CODES", ""),
+        default=os.environ.get("DIAGNOSTIC_CODE_SYSTEM", "icd10"),
         help=(
-            "Comma-separated OPCS-4 procedure codes "
-            "(e.g. 'K40.1,W37.1'). Overrides OPCS4_CODES env var."
+            "Coding standard the --diagnostic-codes belong to (default: 'icd10'). "
+            "Any system registered in src/codes/registry.py may be used - see "
+            "that module for how to add support for another standard (e.g. "
+            "ICD-11, SNOMED CT)."
         ),
     )
+    parser.add_argument(
+        "--procedure-codes",
+        type=str,
+        default=os.environ.get("PROCEDURE_CODES", os.environ.get("OPCS4_CODES", "")),
+        help=(
+            "Comma-separated procedure codes (e.g. 'K40.1,W37.1'). Overrides "
+            "PROCEDURE_CODES (or legacy OPCS4_CODES) env var. Interpreted under "
+            "--procedure-code-system."
+        ),
+    )
+    parser.add_argument(
+        "--procedure-code-system",
+        type=str,
+        default=os.environ.get("PROCEDURE_CODE_SYSTEM", "opcs4"),
+        help=(
+            "Coding standard the --procedure-codes belong to (default: 'opcs4'). "
+            "Any system registered in src/codes/registry.py may be used (e.g. "
+            "CPT, HCPCS)."
+        ),
+    )
+    # Deprecated aliases, kept for backward compatibility with existing
+    # scripts/.env files. Equivalent to --diagnostic-codes/--procedure-codes
+    # with the code system forced to icd10/opcs4 respectively.
+    parser.add_argument("--icd10-codes", type=str, default="", help=argparse.SUPPRESS)
+    parser.add_argument("--opcs4-codes", type=str, default="", help=argparse.SUPPRESS)
     parser.add_argument(
         "--n-patients",
         type=int,
@@ -224,7 +261,14 @@ def _stub_patient(index: int) -> dict:
     }
 
 
-def _stub_admission(patient: dict, admission_date: str, icd10_codes: list, opcs4_codes: list) -> dict:
+def _stub_admission(
+    patient: dict,
+    admission_date: str,
+    diagnostic_codes: list,
+    diagnostic_code_system: str,
+    procedure_codes: list,
+    procedure_code_system: str,
+) -> dict:
     """Return stub admission data for test mode."""
     return {
         "admission_id": str(uuid.uuid4()),
@@ -232,8 +276,10 @@ def _stub_admission(patient: dict, admission_date: str, icd10_codes: list, opcs4
         "admission_type": "emergency",
         "admission_method": "Emergency department",
         "admission_date": admission_date,
-        "icd10_codes": icd10_codes,
-        "opcs4_codes": opcs4_codes,
+        "diagnostic_codes": diagnostic_codes,
+        "diagnostic_code_system": diagnostic_code_system if diagnostic_codes else None,
+        "procedure_codes": procedure_codes,
+        "procedure_code_system": procedure_code_system if procedure_codes else None,
         "specialty": "General Medicine",
         "ward": "Medical Assessment Unit (MAU)",
         "estimated_los_days": 4,
@@ -283,47 +329,60 @@ def _stub_note(event: dict, patient: dict) -> str:
 
 
 def step_parse_codes(
-    icd10_str: str,
-    opcs4_str: str,
+    diagnostic_codes_str: str,
+    diagnostic_code_system: str,
+    procedure_codes_str: str,
+    procedure_code_system: str,
     mods: dict,
 ) -> tuple[list[str], list[str]]:
-    """Parse ICD-10 and OPCS-4 code strings into validated lists.
+    """Parse and validate diagnostic/procedure code strings.
+
+    Works for any code system registered in src/codes/registry.py, not just
+    the built-in ICD-10/OPCS-4 - diagnostic_code_system and
+    procedure_code_system select which registered CodeSystem to validate
+    and look up descriptions against.
 
     Args:
-        icd10_str: Comma-separated ICD-10 code string.
-        opcs4_str: Comma-separated OPCS-4 code string.
+        diagnostic_codes_str: Comma-separated diagnostic code string.
+        diagnostic_code_system: Registry key for the diagnostic code system.
+        procedure_codes_str: Comma-separated procedure code string.
+        procedure_code_system: Registry key for the procedure code system.
         mods: Module namespace dict.
 
     Returns:
-        Tuple of (icd10_codes, opcs4_codes) lists.
+        Tuple of (diagnostic_codes, procedure_codes) lists.
     """
-    icd10_codes = mods["icd10"].parse_codes(icd10_str)
-    opcs4_codes = mods["opcs4"].parse_codes(opcs4_str)
+    registry = mods["registry"]
 
-    if icd10_codes:
-        logger.info("ICD-10 codes: %s", ", ".join(icd10_codes))
-        for code in icd10_codes:
-            info = mods["icd10"].lookup_code(code)
+    diagnostic_codes = registry.parse_codes(diagnostic_codes_str)
+    procedure_codes = registry.parse_codes(procedure_codes_str)
+
+    if diagnostic_codes:
+        diag_system = registry.get_code_system(diagnostic_code_system)
+        logger.info("%s (diagnostic) codes: %s", diag_system.name, ", ".join(diagnostic_codes))
+        for code in diagnostic_codes:
+            info = registry.lookup_code(diag_system, code)
             if info:
-                logger.info("  %s: %s (%s)", code, info["description"], info["specialty"])
+                specialty = info.get(diag_system.specialty_field, "")
+                logger.info("  %s: %s (%s)", code, info.get("description", ""), specialty)
             else:
-                logger.warning("  %s: not found in curated dictionary", code)
+                logger.warning("  %s: not found in curated %s dictionary", code, diag_system.name)
 
-    if opcs4_codes:
-        logger.info("OPCS-4 codes: %s", ", ".join(opcs4_codes))
-        for code in opcs4_codes:
-            info = mods["opcs4"].lookup_code(code)
+    if procedure_codes:
+        proc_system = registry.get_code_system(procedure_code_system)
+        logger.info("%s (procedure) codes: %s", proc_system.name, ", ".join(procedure_codes))
+        for code in procedure_codes:
+            info = registry.lookup_code(proc_system, code)
             if info:
-                logger.info(
-                    "  %s: %s (%s)", code, info["description"], info["surgical_specialty"]
-                )
+                specialty = info.get(proc_system.specialty_field, "")
+                logger.info("  %s: %s (%s)", code, info.get("description", ""), specialty)
             else:
-                logger.warning("  %s: not found in curated dictionary", code)
+                logger.warning("  %s: not found in curated %s dictionary", code, proc_system.name)
 
-    if not icd10_codes and not opcs4_codes:
+    if not diagnostic_codes and not procedure_codes:
         logger.info("No codes provided - will generate random admissions")
 
-    return icd10_codes, opcs4_codes
+    return diagnostic_codes, procedure_codes
 
 
 def step_generate_patient(
@@ -356,8 +415,10 @@ def step_generate_patient(
 
 def step_generate_admission(
     patient: dict,
-    icd10_codes: list[str],
-    opcs4_codes: list[str],
+    diagnostic_codes: list[str],
+    diagnostic_code_system: str,
+    procedure_codes: list[str],
+    procedure_code_system: str,
     admission_date: str,
     mods: dict,
     model: str | None,
@@ -367,8 +428,10 @@ def step_generate_admission(
 
     Args:
         patient: Patient demographics dict.
-        icd10_codes: List of ICD-10 codes (may be empty).
-        opcs4_codes: List of OPCS-4 codes (may be empty).
+        diagnostic_codes: List of diagnostic codes (may be empty).
+        diagnostic_code_system: Registry key for the diagnostic code system.
+        procedure_codes: List of procedure codes (may be empty).
+        procedure_code_system: Registry key for the procedure code system.
         admission_date: ISO date string.
         mods: Module namespace dict.
         model: Optional model override.
@@ -378,17 +441,22 @@ def step_generate_admission(
         Admission details dict.
     """
     if test_mode:
-        return _stub_admission(patient, admission_date, icd10_codes, opcs4_codes)
+        return _stub_admission(
+            patient, admission_date, diagnostic_codes, diagnostic_code_system,
+            procedure_codes, procedure_code_system,
+        )
 
     logger.info("  Generating admission...")
     admission_time = mods["processing"].random_24_hour_time()
     admission = mods["processing"].generate_from_codes(
-        icd10_codes=icd10_codes,
-        opcs4_codes=opcs4_codes,
+        diagnostic_codes=diagnostic_codes,
+        procedure_codes=procedure_codes,
         patient_details=patient,
         admission_date=admission_date,
         admission_time=admission_time,
         model=model,
+        diagnostic_code_system=diagnostic_code_system,
+        procedure_code_system=procedure_code_system,
     )
     admission["admission_id"] = str(uuid.uuid4())
     admission["patient_id"] = patient.get("person_id", str(uuid.uuid4()))
@@ -566,6 +634,69 @@ def step_generate_notes(
     return notes
 
 
+def step_verify_code_reflection(
+    patient: dict,
+    admission: dict,
+    journey: list[dict],
+    notes: list[dict],
+    diagnostic_codes: list[str],
+    diagnostic_code_system: str,
+    procedure_codes: list[str],
+    procedure_code_system: str,
+    mods: dict,
+    patient_idx: int,
+) -> dict:
+    """Backward-pass check: verify driving codes are reflected in output.
+
+    Runs src.processing.check_code_reflected for every diagnostic and
+    procedure code that drove this admission, logs a warning for any code
+    that didn't make it into the admission record or the clinical notes,
+    and returns a report suitable for attaching to the admission record and
+    rolling up into the generation summary.
+
+    Args:
+        patient: Generated patient dict.
+        admission: Generated admission dict.
+        journey: Generated journey event list.
+        notes: Generated clinical note list.
+        diagnostic_codes: Diagnostic codes that drove this admission.
+        diagnostic_code_system: Registry key for the diagnostic code system.
+        procedure_codes: Procedure codes that drove this admission.
+        procedure_code_system: Registry key for the procedure code system.
+        mods: Module namespace dict.
+        patient_idx: 1-based patient index, for log messages.
+
+    Returns:
+        Dict mapping each code to its per-part reflection result.
+    """
+    processing = mods["processing"]
+    report: dict[str, dict[str, bool]] = {}
+
+    for code in diagnostic_codes:
+        result = processing.check_code_reflected(
+            code, diagnostic_code_system, patient, admission, journey, notes
+        )
+        report[code] = result
+        if not (result["admission"] or result["notes"]):
+            logger.warning(
+                "  Patient %d: diagnostic code %s (%s) not reflected in admission or notes",
+                patient_idx, code, diagnostic_code_system,
+            )
+
+    for code in procedure_codes:
+        result = processing.check_code_reflected(
+            code, procedure_code_system, patient, admission, journey, notes
+        )
+        report[code] = result
+        if not (result["admission"] or result["notes"]):
+            logger.warning(
+                "  Patient %d: procedure code %s (%s) not reflected in admission or notes",
+                patient_idx, code, procedure_code_system,
+            )
+
+    return report
+
+
 # ---------------------------------------------------------------------------
 # Output helpers
 # ---------------------------------------------------------------------------
@@ -576,6 +707,7 @@ def save_outputs(
     all_admissions: list[dict],
     all_journeys: list[list[dict]],
     all_notes: list[list[dict]],
+    all_code_reflection_reports: list[dict],
     output_dir: str,
     mods: dict,
 ) -> None:
@@ -586,6 +718,8 @@ def save_outputs(
         all_admissions: List of admission dicts.
         all_journeys: List of journey event lists.
         all_notes: List of clinical note lists.
+        all_code_reflection_reports: List of per-patient code reflection
+            check reports (see step_verify_code_reflection).
         output_dir: Directory to write CSV files.
         mods: Module namespace dict.
     """
@@ -643,7 +777,8 @@ def save_outputs(
 
     # Summary JSON
     summary = mods["processing"].build_output_info(
-        all_patients, all_admissions, all_journeys, all_notes
+        all_patients, all_admissions, all_journeys, all_notes,
+        code_reflection_reports=all_code_reflection_reports,
     )
     summary_path = os.path.join(output_dir, "generation_summary.json")
     with open(summary_path, "w") as f:
@@ -656,6 +791,7 @@ def print_summary(
     all_admissions: list[dict],
     all_journeys: list[list[dict]],
     all_notes: list[list[dict]],
+    all_code_reflection_reports: list[dict],
     output_dir: str,
 ) -> None:
     """Print a human-readable summary of the generation run to stdout.
@@ -665,6 +801,8 @@ def print_summary(
         all_admissions: List of admission dicts.
         all_journeys: List of journey event lists.
         all_notes: List of clinical note lists.
+        all_code_reflection_reports: List of per-patient code reflection
+            check reports (see step_verify_code_reflection).
         output_dir: Output directory path.
     """
     total_events = sum(len(j) for j in all_journeys)
@@ -693,6 +831,20 @@ def print_summary(
     print(f"\nNote type distribution:")
     for nt, count in sorted(note_type_counts.items(), key=lambda x: -x[1]):
         print(f"  {nt:<35} {count:>4}")
+
+    if all_code_reflection_reports:
+        total_codes = 0
+        reflected_codes = 0
+        for report in all_code_reflection_reports:
+            for result in report.values():
+                total_codes += 1
+                if result["admission"] or result["notes"]:
+                    reflected_codes += 1
+        print(f"\nDiagnostic/procedure code reflection (backward-pass check):")
+        print(f"  {reflected_codes}/{total_codes} codes reflected in admission or notes")
+        if reflected_codes < total_codes:
+            print("  See generation_summary.json / logs for codes that weren't reflected.")
+
     print(f"\nOutput directory: {os.path.abspath(output_dir)}")
     print("=" * 60 + "\n")
 
@@ -731,10 +883,37 @@ def run_pipeline(args: argparse.Namespace) -> int:
         logger.error("Module import failed: %s", exc)
         return 1
 
+    # Resolve deprecated --icd10-codes/--opcs4-codes aliases: they win only
+    # if the corresponding generic flag was left at its default (empty).
+    diagnostic_codes_str = args.diagnostic_codes
+    diagnostic_code_system = args.diagnostic_code_system
+    if not diagnostic_codes_str and args.icd10_codes:
+        logger.warning(
+            "--icd10-codes is deprecated, use --diagnostic-codes "
+            "(--diagnostic-code-system defaults to 'icd10')."
+        )
+        diagnostic_codes_str = args.icd10_codes
+        diagnostic_code_system = "icd10"
+
+    procedure_codes_str = args.procedure_codes
+    procedure_code_system = args.procedure_code_system
+    if not procedure_codes_str and args.opcs4_codes:
+        logger.warning(
+            "--opcs4-codes is deprecated, use --procedure-codes "
+            "(--procedure-code-system defaults to 'opcs4')."
+        )
+        procedure_codes_str = args.opcs4_codes
+        procedure_code_system = "opcs4"
+
     # Parse and validate codes
-    icd10_codes, opcs4_codes = step_parse_codes(
-        args.icd10_codes, args.opcs4_codes, mods
-    )
+    try:
+        diagnostic_codes, procedure_codes = step_parse_codes(
+            diagnostic_codes_str, diagnostic_code_system,
+            procedure_codes_str, procedure_code_system, mods,
+        )
+    except KeyError as exc:
+        logger.error("Invalid code system: %s", exc)
+        return 1
 
     # Determine model
     model: str | None = args.model or None
@@ -744,6 +923,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
     all_admissions: list[dict] = []
     all_journeys: list[list[dict]] = []
     all_notes: list[list[dict]] = []
+    all_code_reflection_reports: list[dict] = []
 
     n_patients = 1 if args.test_mode else args.n_patients
     admission_date = args.admission_date
@@ -760,7 +940,8 @@ def run_pipeline(args: argparse.Namespace) -> int:
 
             # Step 2: Generate admission (code-driven or random)
             admission = step_generate_admission(
-                patient, icd10_codes, opcs4_codes,
+                patient, diagnostic_codes, diagnostic_code_system,
+                procedure_codes, procedure_code_system,
                 admission_date, mods, model, args.test_mode
             )
 
@@ -778,6 +959,19 @@ def run_pipeline(args: argparse.Namespace) -> int:
                 patient, admission, journey, mods, model,
                 args.test_mode, args.apply_abbreviations, args.apply_typos
             )
+
+            # Step 5: Backward-pass check - do the driving codes actually
+            # show up in what got generated? Skipped in test mode, since
+            # stub notes are placeholder text with no clinical content.
+            if not args.test_mode and (diagnostic_codes or procedure_codes):
+                reflection_report = step_verify_code_reflection(
+                    patient, admission, journey, notes,
+                    diagnostic_codes, diagnostic_code_system,
+                    procedure_codes, procedure_code_system,
+                    mods, patient_idx,
+                )
+                admission["code_reflection_check"] = reflection_report
+                all_code_reflection_reports.append(reflection_report)
 
             all_patients.append(patient)
             all_admissions.append(admission)
@@ -806,14 +1000,17 @@ def run_pipeline(args: argparse.Namespace) -> int:
     try:
         save_outputs(
             all_patients, all_admissions, all_journeys, all_notes,
-            args.output_dir, mods
+            all_code_reflection_reports, args.output_dir, mods
         )
     except Exception as exc:  # noqa: BLE001
         logger.error("Failed to save outputs: %s", exc, exc_info=args.verbose)
         return 1
 
     # Print summary
-    print_summary(all_patients, all_admissions, all_journeys, all_notes, args.output_dir)
+    print_summary(
+        all_patients, all_admissions, all_journeys, all_notes,
+        all_code_reflection_reports, args.output_dir
+    )
 
     logger.info("Pipeline completed successfully.")
     return 0
