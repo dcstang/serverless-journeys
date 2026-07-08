@@ -984,6 +984,56 @@ def generate_from_codes(
 
 
 # ---------------------------------------------------------------------------
+# Diagnosis reflection check (backward pass)
+# ---------------------------------------------------------------------------
+
+
+def check_diagnosis_reflected(
+    icd10_code: str,
+    patient: dict,
+    admission: dict,
+    journey: list[dict],
+    notes: list[dict],
+) -> dict[str, bool]:
+    """Backward-pass check for an ICD-10 diagnosis across generated output.
+
+    The forward pass looks up an ICD-10 code and pushes its description into
+    the generation prompts (see generate_from_codes). This is the matching
+    backward pass: given the generated patient, admission, journey, and notes,
+    confirm the diagnosis actually made it into each part's text content.
+
+    Args:
+        icd10_code: ICD-10 code to search for (e.g. 'I21.0').
+        patient: Generated patient dict.
+        admission: Generated admission dict.
+        journey: Generated list of journey event dicts.
+        notes: Generated list of clinical note dicts.
+
+    Returns:
+        Dict with keys 'patient', 'admission', 'journey', 'notes', each True
+        if the code or a keyword from its description appears in that part.
+    """
+    from src.codes.icd10 import lookup_code  # noqa: PLC0415
+
+    info = lookup_code(icd10_code)
+    description = info["description"] if info else ""
+
+    needles = {icd10_code.strip().lower()}
+    needles.update(word.lower() for word in re.findall(r"[A-Za-z]{4,}", description))
+
+    def _contains(part: Any) -> bool:
+        haystack = json.dumps(part, default=str).lower()
+        return any(needle in haystack for needle in needles)
+
+    return {
+        "patient": _contains(patient),
+        "admission": _contains(admission),
+        "journey": _contains(journey),
+        "notes": _contains(notes),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Generate patient record (demographics)
 # ---------------------------------------------------------------------------
 
@@ -1118,6 +1168,7 @@ def generate_clinical_note(
     from src.prompts import note_prompts  # noqa: PLC0415
 
     patient_str = json.dumps(clean_patient_details(patient), indent=2)
+    admission_str = json.dumps(clean_event_details(admission), indent=2)
     event_str = json.dumps(clean_event_details(event), indent=2)
     prev_str = json.dumps(
         [clean_event_details(e) for e in previous_events[-5:]], indent=2
@@ -1125,6 +1176,7 @@ def generate_clinical_note(
 
     prompt = note_prompts["clinical_note_prompt"].substitute(
         PATIENT_DETAILS=patient_str,
+        ADMISSION_DETAILS=admission_str,
         EVENT_DETAILS=event_str,
         PREVIOUS_EVENTS=prev_str,
         NOTE_TEMPLATE=note_template_str,
