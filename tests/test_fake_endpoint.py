@@ -148,3 +148,33 @@ class TestFakeEndpointGenerateFromCodes:
         # Forward check: the code was actually part of the outbound request.
         sent_prompt = fake_llm_endpoint.requests_received[0]["messages"][-1]["content"]
         assert code in sent_prompt
+
+    def test_generate_from_codes_works_end_to_end_for_opcs4(self, fake_llm_endpoint, sample_patient):
+        code = "K40.1"
+
+        def respond(request_data):
+            return json.dumps(
+                {
+                    "admission_type": "elective",
+                    "planned_procedure": "Coronary artery bypass grafting using saphenous vein graft",
+                    "indication": f"Triple vessel disease - {code} planned",
+                    "estimated_los_days": 8,
+                }
+            )
+
+        fake_llm_endpoint.set_response(respond)
+
+        admission = processing.generate_from_codes(
+            icd10_codes=[],
+            opcs4_codes=[code],
+            patient_details=sample_patient,
+            admission_date="2026-07-08",
+            admission_time="09:00",
+            model="fake-model",
+        )
+
+        assert admission["opcs4_codes"] == [code]
+        assert code in admission["indication"]
+
+        sent_prompt = fake_llm_endpoint.requests_received[0]["messages"][-1]["content"]
+        assert code in sent_prompt

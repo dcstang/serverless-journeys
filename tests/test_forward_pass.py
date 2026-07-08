@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 
 from src import processing
-from src.codes import icd10
+from src.codes import icd10, opcs4
 
 
 class TestForwardPassSingleIcd10Code:
@@ -118,6 +118,73 @@ class TestForwardPassMultiCode:
 
         assert "ZZ99.9" in captured["prompt"]
         assert admission["icd10_codes"] == ["ZZ99.9"]
+
+
+class TestForwardPassOpcs4Only:
+    """The opcs4-only branch of generate_from_codes uses a separate prompt
+    template (opcs4_admission_prompt) from the ICD-10 path, so it needs its
+    own forward-pass coverage rather than piggybacking on the ICD-10 tests."""
+
+    def test_code_and_description_are_injected_into_prompt(self, monkeypatch, sample_patient):
+        captured = {}
+
+        def fake_call_llm(prompt, model=None, temp=0.7, **kwargs):
+            captured["prompt"] = prompt
+            return json.dumps({"admission_type": "elective", "estimated_los_days": 8})
+
+        monkeypatch.setattr(processing, "call_llm", fake_call_llm)
+
+        processing.generate_from_codes(
+            icd10_codes=[],
+            opcs4_codes=["K40.1"],
+            patient_details=sample_patient,
+            admission_date="2026-07-08",
+            admission_time="09:00",
+        )
+
+        prompt = captured["prompt"]
+        assert "K40.1" in prompt
+        assert "Coronary artery bypass grafting using saphenous vein graft" in prompt
+
+    def test_admission_dict_carries_input_codes_forward(self, monkeypatch, sample_patient):
+        monkeypatch.setattr(
+            processing,
+            "call_llm",
+            lambda prompt, model=None, temp=0.7, **kw: json.dumps({"estimated_los_days": 8}),
+        )
+
+        admission = processing.generate_from_codes(
+            icd10_codes=[],
+            opcs4_codes=["K40.1"],
+            patient_details=sample_patient,
+            admission_date="2026-07-08",
+            admission_time="09:00",
+        )
+
+        assert admission["opcs4_codes"] == ["K40.1"]
+        assert admission["icd10_codes"] == []
+
+    def test_unknown_opcs4_code_is_still_sent_through(self, monkeypatch, sample_patient):
+        captured = {}
+
+        def fake_call_llm(prompt, model=None, temp=0.7, **kwargs):
+            captured["prompt"] = prompt
+            return json.dumps({"estimated_los_days": 3})
+
+        monkeypatch.setattr(processing, "call_llm", fake_call_llm)
+
+        assert opcs4.lookup_code("ZZ99.9") is None  # sanity check: genuinely unknown
+
+        admission = processing.generate_from_codes(
+            icd10_codes=[],
+            opcs4_codes=["ZZ99.9"],
+            patient_details=sample_patient,
+            admission_date="2026-07-08",
+            admission_time="09:00",
+        )
+
+        assert "ZZ99.9" in captured["prompt"]
+        assert admission["opcs4_codes"] == ["ZZ99.9"]
 
 
 class TestForwardPassPropagatesIntoJourneyAndNotes:

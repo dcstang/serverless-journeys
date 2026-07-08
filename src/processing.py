@@ -988,6 +988,30 @@ def generate_from_codes(
 # ---------------------------------------------------------------------------
 
 
+def _check_code_reflected(
+    code: str,
+    description: str,
+    patient: dict,
+    admission: dict,
+    journey: list[dict],
+    notes: list[dict],
+) -> dict[str, bool]:
+    """Shared matching logic for check_diagnosis_reflected / check_procedure_reflected."""
+    needles = {code.strip().lower()}
+    needles.update(word.lower() for word in re.findall(r"[A-Za-z]{4,}", description))
+
+    def _contains(part: Any) -> bool:
+        haystack = json.dumps(part, default=str).lower()
+        return any(needle in haystack for needle in needles)
+
+    return {
+        "patient": _contains(patient),
+        "admission": _contains(admission),
+        "journey": _contains(journey),
+        "notes": _contains(notes),
+    }
+
+
 def check_diagnosis_reflected(
     icd10_code: str,
     patient: dict,
@@ -1017,20 +1041,37 @@ def check_diagnosis_reflected(
 
     info = lookup_code(icd10_code)
     description = info["description"] if info else ""
+    return _check_code_reflected(icd10_code, description, patient, admission, journey, notes)
 
-    needles = {icd10_code.strip().lower()}
-    needles.update(word.lower() for word in re.findall(r"[A-Za-z]{4,}", description))
 
-    def _contains(part: Any) -> bool:
-        haystack = json.dumps(part, default=str).lower()
-        return any(needle in haystack for needle in needles)
+def check_procedure_reflected(
+    opcs4_code: str,
+    patient: dict,
+    admission: dict,
+    journey: list[dict],
+    notes: list[dict],
+) -> dict[str, bool]:
+    """Backward-pass check for an OPCS-4 procedure across generated output.
 
-    return {
-        "patient": _contains(patient),
-        "admission": _contains(admission),
-        "journey": _contains(journey),
-        "notes": _contains(notes),
-    }
+    Mirrors check_diagnosis_reflected for procedure (rather than diagnosis)
+    codes - see that function for the shared rationale.
+
+    Args:
+        opcs4_code: OPCS-4 code to search for (e.g. 'K40.1').
+        patient: Generated patient dict.
+        admission: Generated admission dict.
+        journey: Generated list of journey event dicts.
+        notes: Generated list of clinical note dicts.
+
+    Returns:
+        Dict with keys 'patient', 'admission', 'journey', 'notes', each True
+        if the code or a keyword from its description appears in that part.
+    """
+    from src.codes.opcs4 import lookup_code  # noqa: PLC0415
+
+    info = lookup_code(opcs4_code)
+    description = info["description"] if info else ""
+    return _check_code_reflected(opcs4_code, description, patient, admission, journey, notes)
 
 
 # ---------------------------------------------------------------------------
