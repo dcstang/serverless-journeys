@@ -17,19 +17,36 @@ Usage:
                    --model meta-llama/Meta-Llama-3.1-70B-Instruct-fast \\
                    --diagnostic-codes I21.0 --n-patients 10
 
+    # Research uncurated codes via Google Search and let the pipeline
+    # correct any generated content that ends up missing a driving code:
+    python main.py --diagnostic-codes M75.100 --research-unknown-codes \\
+                   --max-correction-attempts 2
+
+After each patient is generated, a backward-pass check confirms each
+driving code is actually reflected in the admission/notes (not just passed
+in as a parameter); on a miss it applies a targeted corrective regeneration
+(see --max-correction-attempts). For codes with no curated dictionary entry
+in src/codes/icd10.py / opcs4.py, --research-unknown-codes looks the code up
+via Google Custom Search first so generation (and any correction) is
+grounded in what the code actually means, not a guess from the bare code.
+
 Environment variables (override CLI args or provide defaults):
-    ANTHROPIC_API_KEY      - required for anthropic provider
-    OPENAI_API_KEY         - required for openai provider
-    NEBIUS_API_KEY         - required for nebius provider
-    NEBIUS_BASE_URL        - Nebius endpoint (default: https://api.studio.nebius.com/v1/)
-    LLM_PROVIDER           - 'anthropic', 'openai', or 'nebius'
-    MODEL                  - model identifier (e.g. any model id on your Nebius endpoint)
-    N_PATIENTS             - number of patients to generate
-    DIAGNOSTIC_CODES       - comma-separated diagnostic codes
-    DIAGNOSTIC_CODE_SYSTEM - diagnostic coding standard, default 'icd10'
-    PROCEDURE_CODES        - comma-separated procedure codes
-    PROCEDURE_CODE_SYSTEM  - procedure coding standard, default 'opcs4'
-    OUTPUT_DIR             - output directory path
+    ANTHROPIC_API_KEY       - required for anthropic provider
+    OPENAI_API_KEY          - required for openai provider
+    NEBIUS_API_KEY          - required for nebius provider
+    NEBIUS_BASE_URL         - Nebius endpoint (default: https://api.studio.nebius.com/v1/)
+    LLM_PROVIDER            - 'anthropic', 'openai', or 'nebius'
+    MODEL                   - model identifier (e.g. any model id on your Nebius endpoint)
+    N_PATIENTS              - number of patients to generate
+    DIAGNOSTIC_CODES        - comma-separated diagnostic codes
+    DIAGNOSTIC_CODE_SYSTEM  - diagnostic coding standard, default 'icd10'
+    PROCEDURE_CODES         - comma-separated procedure codes
+    PROCEDURE_CODE_SYSTEM   - procedure coding standard, default 'opcs4'
+    MAX_CORRECTION_ATTEMPTS - corrective regenerations per missed code, default 1
+    RESEARCH_UNKNOWN_CODES  - 'true' to research uncurated codes via web search
+    GOOGLE_SEARCH_API_KEY   - required if RESEARCH_UNKNOWN_CODES is enabled
+    GOOGLE_SEARCH_CSE_ID    - required if RESEARCH_UNKNOWN_CODES is enabled
+    OUTPUT_DIR              - output directory path
 """
 
 from __future__ import annotations
@@ -196,6 +213,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "Test mode: generate 1 patient with minimal events using a simple prompt. "
             "Does not call the LLM - uses stub data. Useful for integration testing."
+        ),
+    )
+    parser.add_argument(
+        "--research-unknown-codes",
+        action="store_true",
+        default=os.environ.get("RESEARCH_UNKNOWN_CODES", "false").lower() == "true",
+        help=(
+            "Look up diagnostic/procedure codes with no curated dictionary entry via "
+            "Google Custom Search before generation, so the LLM has real clinical "
+            "grounding instead of guessing from the bare code alone. Requires "
+            "GOOGLE_SEARCH_API_KEY and GOOGLE_SEARCH_CSE_ID. Adds latency/cost per "
+            "unique uncurated code (results are cached for the run)."
+        ),
+    )
+    parser.add_argument(
+        "--max-correction-attempts",
+        type=int,
+        default=int(os.environ.get("MAX_CORRECTION_ATTEMPTS", "1")),
+        help=(
+            "Max targeted corrective regenerations per driving code that the "
+            "backward-pass check finds missing from the generated admission/notes "
+            "(edits just the admission record and first note, not a full patient "
+            "re-run). Set to 0 to disable correction (check-only). Default: 1."
         ),
     )
     parser.add_argument(
@@ -417,6 +457,7 @@ def step_generate_admission(
     mods: dict,
     model: str | None,
     test_mode: bool,
+    enable_code_research: bool = False,
 ) -> dict:
     """Generate an admission record for a patient.
 
@@ -430,6 +471,8 @@ def step_generate_admission(
         mods: Module namespace dict.
         model: Optional model override.
         test_mode: If True, return stub data.
+        enable_code_research: If True, research uncurated codes via web
+            search before generation (see src.codes.research).
 
     Returns:
         Admission details dict.
@@ -451,6 +494,7 @@ def step_generate_admission(
         model=model,
         diagnostic_code_system=diagnostic_code_system,
         procedure_code_system=procedure_code_system,
+        enable_code_research=enable_code_research,
     )
     admission["admission_id"] = str(uuid.uuid4())
     admission["patient_id"] = patient.get("person_id", str(uuid.uuid4()))
@@ -639,53 +683,90 @@ def step_verify_code_reflection(
     procedure_code_system: str,
     mods: dict,
     patient_idx: int,
+    model: str | None,
+    enable_code_research: bool,
+    max_correction_attempts: int,
 ) -> dict:
-    """Backward-pass check: verify driving codes are reflected in output.
+    """Backward-pass check, with bounded targeted correction on a miss.
 
     Runs src.processing.check_code_reflected for every diagnostic and
-    procedure code that drove this admission, logs a warning for any code
-    that didn't make it into the admission record or the clinical notes,
-    and returns a report suitable for attaching to the admission record and
-    rolling up into the generation summary.
+    procedure code that drove this admission. For any code not reflected in
+    the admission or notes, attempts up to max_correction_attempts targeted
+    corrective regenerations (processing.correct_admission_for_code /
+    correct_note_for_code - editing just the admission record and the first
+    journey note, not a full patient re-run), re-checking after each
+    attempt and stopping early once the code is reflected. `admission` and
+    `notes` are mutated in place by any corrections applied. Codes still
+    unreflected after all attempts are logged as warnings.
 
     Args:
         patient: Generated patient dict.
-        admission: Generated admission dict.
+        admission: Generated admission dict (mutated in place on correction).
         journey: Generated journey event list.
-        notes: Generated clinical note list.
+        notes: Generated clinical note list (notes[0] mutated in place on
+            correction, if any notes exist).
         diagnostic_codes: Diagnostic codes that drove this admission.
         diagnostic_code_system: Registry key for the diagnostic code system.
         procedure_codes: Procedure codes that drove this admission.
         procedure_code_system: Registry key for the procedure code system.
         mods: Module namespace dict.
         patient_idx: 1-based patient index, for log messages.
+        model: Optional LLM model override for correction calls.
+        enable_code_research: Whether to research uncurated codes for
+            correction context (see src.codes.research).
+        max_correction_attempts: Max corrective regeneration attempts per
+            unreflected code. 0 disables correction (check-only, matching
+            the previous behaviour).
 
     Returns:
-        Dict mapping each code to its per-part reflection result.
+        Dict mapping each code to its final per-part reflection result
+        (after any corrections).
     """
     processing = mods["processing"]
     report: dict[str, dict[str, bool]] = {}
 
-    for code in diagnostic_codes:
-        result = processing.check_code_reflected(
-            code, diagnostic_code_system, patient, admission, journey, notes
-        )
-        report[code] = result
-        if not (result["admission"] or result["notes"]):
-            logger.warning(
-                "  Patient %d: diagnostic code %s (%s) not reflected in admission or notes",
-                patient_idx, code, diagnostic_code_system,
+    all_codes = [(c, diagnostic_code_system) for c in diagnostic_codes] + [
+        (c, procedure_code_system) for c in procedure_codes
+    ]
+
+    for code, code_system in all_codes:
+        result = processing.check_code_reflected(code, code_system, patient, admission, journey, notes)
+
+        attempts = 0
+        while not (result["admission"] or result["notes"]) and attempts < max_correction_attempts:
+            attempts += 1
+            logger.info(
+                "  Patient %d: correcting code %s (%s), attempt %d/%d",
+                patient_idx, code, code_system, attempts, max_correction_attempts,
+            )
+            code_context = processing.get_code_context(
+                code_system, code, enable_research=enable_code_research, model=model
+            )
+            admission.update(
+                processing.correct_admission_for_code(admission, code, code_context, model=model)
+            )
+            if notes:
+                corrected_text = processing.correct_note_for_code(
+                    notes[0]["clean_note_text"], code, code_context, model=model
+                )
+                notes[0]["clean_note_text"] = corrected_text
+                notes[0]["raw_blob_content"] = corrected_text
+
+            result = processing.check_code_reflected(
+                code, code_system, patient, admission, journey, notes
             )
 
-    for code in procedure_codes:
-        result = processing.check_code_reflected(
-            code, procedure_code_system, patient, admission, journey, notes
-        )
         report[code] = result
         if not (result["admission"] or result["notes"]):
+            suffix = f" after {attempts} correction attempt(s)" if attempts else ""
             logger.warning(
-                "  Patient %d: procedure code %s (%s) not reflected in admission or notes",
-                patient_idx, code, procedure_code_system,
+                "  Patient %d: code %s (%s) not reflected in admission or notes%s",
+                patient_idx, code, code_system, suffix,
+            )
+        elif attempts:
+            logger.info(
+                "  Patient %d: code %s (%s) reflected after %d correction attempt(s)",
+                patient_idx, code, code_system, attempts,
             )
 
     return report
@@ -917,7 +998,8 @@ def run_pipeline(args: argparse.Namespace) -> int:
             admission = step_generate_admission(
                 patient, diagnostic_codes, diagnostic_code_system,
                 procedure_codes, procedure_code_system,
-                admission_date, mods, model, args.test_mode
+                admission_date, mods, model, args.test_mode,
+                args.research_unknown_codes,
             )
 
             # Step 3: Generate patient journey
@@ -935,15 +1017,17 @@ def run_pipeline(args: argparse.Namespace) -> int:
                 args.test_mode, args.apply_abbreviations, args.apply_typos
             )
 
-            # Step 5: Backward-pass check - do the driving codes actually
-            # show up in what got generated? Skipped in test mode, since
-            # stub notes are placeholder text with no clinical content.
+            # Step 5: Backward-pass check (+ targeted correction on a miss) -
+            # do the driving codes actually show up in what got generated?
+            # Skipped in test mode, since stub notes are placeholder text
+            # with no clinical content.
             if not args.test_mode and (diagnostic_codes or procedure_codes):
                 reflection_report = step_verify_code_reflection(
                     patient, admission, journey, notes,
                     diagnostic_codes, diagnostic_code_system,
                     procedure_codes, procedure_code_system,
-                    mods, patient_idx,
+                    mods, patient_idx, model,
+                    args.research_unknown_codes, args.max_correction_attempts,
                 )
                 admission["code_reflection_check"] = reflection_report
                 all_code_reflection_reports.append(reflection_report)

@@ -8,6 +8,8 @@ Categories:
   - note_prompts: clinical note generation
   - processing_prompts: post-processing (cleaning, abbreviations)
   - evaluation_prompts: quality evaluation metrics
+  - research_prompts: web-search-grounded code research (src/codes/research.py)
+  - correction_prompts: targeted backward-pass correction (main.py)
 
 Adapted from nhsengland/synthetic_clinical_notes with additions for
 ICD-10 and OPCS-4 code-driven generation.
@@ -510,5 +512,70 @@ evaluation_prompts: dict[str, Template] = {
         "- irrelevant_content: list of inappropriate content found\n"
         "- diagnosis_specificity_score: float 0.0-1.0\n\n"
         "Return ONLY valid JSON."
+    ),
+}
+
+# ---------------------------------------------------------------------------
+# research_prompts
+# Web-search-grounded research for codes with no curated dictionary entry
+# ---------------------------------------------------------------------------
+
+research_prompts: dict[str, Template] = {
+
+    "research_code_prompt": Template(
+        "You are a clinical coding specialist. Based on the web search results below, "
+        "produce a concise, clinically accurate summary of the following code so it can "
+        "be used to generate realistic NHS clinical documentation.\n\n"
+        "CODE: $CODE\n"
+        "CODE SYSTEM: $CODE_SYSTEM ($CODE_KIND code)\n\n"
+        "WEB SEARCH RESULTS:\n$SEARCH_RESULTS\n\n"
+        "Using ONLY information grounded in the search results above (do not invent "
+        "clinical facts not supported by them), return a JSON object with:\n"
+        "- description: concise clinical name/description of this code (one line)\n"
+        "- specialty: the most relevant NHS clinical/surgical specialty\n"
+        "- type: 'emergency' or 'elective' - typical acuity for this diagnosis/procedure\n"
+        "- typical_los_days_min: integer, typical minimum NHS length of stay in days\n"
+        "- typical_los_days_max: integer, typical maximum NHS length of stay in days\n"
+        "- confidence: 'high' or 'low' - use 'low' if the search results were too sparse, "
+        "off-topic, or ambiguous to confidently determine the above\n\n"
+        "Return ONLY valid JSON."
+    ),
+}
+
+# ---------------------------------------------------------------------------
+# correction_prompts
+# Targeted backward-pass correction when a driving code isn't reflected in
+# already-generated content
+# ---------------------------------------------------------------------------
+
+correction_prompts: dict[str, Template] = {
+
+    "correct_admission_prompt": Template(
+        "You are an NHS clinician revising a synthetic admission record. The record "
+        "below was meant to be grounded in a specific diagnosis/procedure, but a "
+        "review found that it does not clearly reflect it. Revise the record so it "
+        "explicitly and clinically incorporates the code below, changing as little "
+        "else as possible.\n\n"
+        "CODE TO INCORPORATE: $CODE\n"
+        "CLINICAL CONTEXT:\n$CODE_CONTEXT\n\n"
+        "CURRENT ADMISSION RECORD (JSON):\n$CURRENT_ADMISSION\n\n"
+        "Return the revised admission record as a JSON object with the same keys as "
+        "the current record above, updated so that chief_complaint, "
+        "history_of_presenting_complaint / indication, working_diagnosis / "
+        "planned_procedure, and management_plan (whichever of these keys are present) "
+        "clearly and specifically reflect the code above. "
+        "Return ONLY valid JSON."
+    ),
+
+    "correct_note_prompt": Template(
+        "You are an NHS clinician revising a synthetic clinical note. The note below "
+        "was meant to be consistent with a specific diagnosis/procedure, but a review "
+        "found that it does not clearly reflect it. Revise the note so it explicitly "
+        "and clinically incorporates the code below, changing as little else as "
+        "possible and preserving the note's original structure and style.\n\n"
+        "CODE TO INCORPORATE: $CODE\n"
+        "CLINICAL CONTEXT:\n$CODE_CONTEXT\n\n"
+        "CURRENT NOTE TEXT:\n$CURRENT_NOTE\n\n"
+        "Return the revised note text only - no JSON wrapper, no explanatory comments."
     ),
 }

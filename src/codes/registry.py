@@ -145,6 +145,45 @@ def infer_specialty(system: CodeSystem, code: str) -> str:
     return system.chapter_map.get(chapter_letter, system.default_specialty)
 
 
+def format_code_context(system: CodeSystem, code: str, info: dict) -> str:
+    """Format a code's metadata dict into a rich LLM-prompt-ready description.
+
+    Shared by get_clinical_context (curated codes) and code research (see
+    src/codes/research.py, which synthesizes an info dict for uncurated
+    codes via web search and formats it the same way).
+
+    Args:
+        system: The CodeSystem the code belongs to.
+        code: The code string.
+        info: Metadata dict (same shape as a CodeSystem.codes entry).
+
+    Returns:
+        Formatted description string.
+    """
+    code_upper = code.strip().upper()
+    description = info.get("description", code_upper)
+    specialty = info.get(system.specialty_field, system.default_specialty)
+    los = info.get("typical_los_days")
+    type_word = info.get(system.type_field) if system.type_field else None
+
+    parts = [f"{system.name} {code_upper} ({description})."]
+    if type_word:
+        article = "an" if str(type_word)[0].lower() in "aeiou" else "a"
+        parts.append(f"This patient is being managed as {article} {type_word} case.")
+    parts.append(f"Specialty: {specialty}.")
+    if los:
+        low, high = los
+        if high <= 1:
+            parts.append("Typical length of stay: day case (no overnight stay).")
+        else:
+            parts.append(f"Typical length of stay: {low}-{high} days.")
+    parts.append(
+        "Ensure all generated content is clinically appropriate for this code, "
+        "including relevant investigations, treatments, and specialist involvement."
+    )
+    return " ".join(parts)
+
+
 def get_clinical_context(system: CodeSystem, code: str) -> str:
     """Return a rich text description of a code suitable for LLM prompts.
 
@@ -168,24 +207,4 @@ def get_clinical_context(system: CodeSystem, code: str) -> str:
             f"standard UK clinical practice and NHS documentation conventions."
         )
 
-    description = info.get("description", code_upper)
-    specialty = info.get(system.specialty_field, system.default_specialty)
-    los = info.get("typical_los_days")
-    type_word = info.get(system.type_field) if system.type_field else None
-
-    parts = [f"{system.name} {code_upper} ({description})."]
-    if type_word:
-        article = "an" if str(type_word)[0].lower() in "aeiou" else "a"
-        parts.append(f"This patient is being managed as {article} {type_word} case.")
-    parts.append(f"Specialty: {specialty}.")
-    if los:
-        low, high = los
-        if high <= 1:
-            parts.append("Typical length of stay: day case (no overnight stay).")
-        else:
-            parts.append(f"Typical length of stay: {low}-{high} days.")
-    parts.append(
-        "Ensure all generated content is clinically appropriate for this code, "
-        "including relevant investigations, treatments, and specialist involvement."
-    )
-    return " ".join(parts)
+    return format_code_context(system, code_upper, info)

@@ -883,6 +883,31 @@ def read_write_data(
 # ---------------------------------------------------------------------------
 
 
+def _build_code_context(
+    system: Any,
+    code: str,
+    enable_research: bool,
+    model: str | None,
+) -> str:
+    """Build LLM-prompt-ready context for a single code.
+
+    For codes not in the system's curated dictionary, uses web-search-backed
+    research (src/codes/research.py) when enable_research is True, falling
+    back to the generic "code not found" message otherwise or if research
+    fails to produce a confident result.
+    """
+    from src.codes import registry  # noqa: PLC0415
+
+    if enable_research and registry.lookup_code(system, code) is None:
+        from src.codes import research  # noqa: PLC0415
+
+        researched = research.get_researched_clinical_context(system, code, model=model)
+        if researched is not None:
+            return researched
+
+    return registry.get_clinical_context(system, code)
+
+
 def generate_from_codes(
     diagnostic_codes: list[str],
     procedure_codes: list[str],
@@ -892,6 +917,7 @@ def generate_from_codes(
     model: str | None = None,
     diagnostic_code_system: str = "icd10",
     procedure_code_system: str = "opcs4",
+    enable_code_research: bool = False,
 ) -> dict:
     """Generate an admission record driven by diagnostic and/or procedure codes.
 
@@ -916,6 +942,9 @@ def generate_from_codes(
             the codes belong to (default 'icd10').
         procedure_code_system: Registry key for the procedure code system
             the codes belong to (default 'opcs4').
+        enable_code_research: If True, codes with no curated dictionary
+            entry are researched via web search before generation (adds
+            latency/cost per unique uncurated code - see src/codes/research.py).
 
     Returns:
         Dict containing generated admission data, enriched with
@@ -931,11 +960,17 @@ def generate_from_codes(
         proc_system = registry.get_code_system(procedure_code_system)
 
         diagnoses_str = (
-            "\n".join(registry.get_clinical_context(diag_system, c) for c in diagnostic_codes)
+            "\n".join(
+                _build_code_context(diag_system, c, enable_code_research, model)
+                for c in diagnostic_codes
+            )
             or "None specified."
         )
         procedures_str = (
-            "\n".join(registry.get_clinical_context(proc_system, c) for c in procedure_codes)
+            "\n".join(
+                _build_code_context(proc_system, c, enable_code_research, model)
+                for c in procedure_codes
+            )
             or "None specified."
         )
 
@@ -978,6 +1013,130 @@ def generate_from_codes(
     admission_data["procedure_codes"] = procedure_codes
     admission_data["procedure_code_system"] = procedure_code_system if procedure_codes else None
     return admission_data
+
+
+def get_code_context(
+    code_system: str,
+    code: str,
+    enable_research: bool = False,
+    model: str | None = None,
+) -> str:
+    """Resolve a registered code system by key and build LLM-ready context for a code.
+
+    Public entry point for callers outside this module (e.g. main.py's
+    corrective retry step) that only have a code system key string, not a
+    CodeSystem instance.
+
+    Args:
+        code_system: Registry key of the code system (e.g. 'icd10').
+        code: The code to build context for.
+        enable_research: If True, research uncurated codes via web search.
+        model: Optional model override for the research synthesis call.
+
+    Returns:
+        LLM-prompt-ready context string.
+    """
+    from src.codes import registry  # noqa: PLC0415
+
+    system = registry.get_code_system(code_system)
+    return _build_code_context(system, code, enable_research, model)
+
+
+# ---------------------------------------------------------------------------
+# Targeted backward-pass correction
+# ---------------------------------------------------------------------------
+
+
+def correct_admission_for_code(
+    admission: dict,
+    code: str,
+    code_context: str,
+    model: str | None = None,
+) -> dict:
+    """Revise an admission record so it explicitly reflects a given code.
+
+    Used as a targeted corrective step after check_code_reflected finds a
+    driving code missing from the admission's clinical narrative - re-runs
+    generation for just this admission rather than the whole patient.
+
+    Args:
+        admission: Current admission dict.
+        code: The code that should be reflected.
+        code_context: LLM-ready clinical context for the code (see
+            get_code_context).
+        model: Optional model override.
+
+    Returns:
+        A new admission dict with narrative fields revised. Bookkeeping
+        fields (diagnostic_codes/procedure_codes/*_system) are preserved
+        from the original admission unchanged. On any failure (LLM error,
+        unparseable response), returns the original admission unchanged.
+    """
+    from src.prompts import correction_prompts  # noqa: PLC0415
+
+    narrative = {k: v for k, v in admission.items() if k not in _ADMISSION_CODE_BOOKKEEPING_FIELDS}
+    prompt = correction_prompts["correct_admission_prompt"].substitute(
+        CODE=code,
+        CODE_CONTEXT=code_context,
+        CURRENT_ADMISSION=json.dumps(narrative, indent=2, default=str),
+    )
+
+    try:
+        response = call_llm(prompt, model=model, temp=0.4)
+        revised_narrative = parse_llm_json(response)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Admission correction failed for code %s: %s", code, exc)
+        return admission
+
+    if not isinstance(revised_narrative, dict):
+        logger.warning("Admission correction for code %s returned non-dict JSON, discarding", code)
+        return admission
+
+    corrected = dict(admission)
+    corrected.update(revised_narrative)
+    # Bookkeeping fields are ours to manage, not the LLM's - restore them
+    # in case the model echoed or altered them despite not being asked to.
+    for field in _ADMISSION_CODE_BOOKKEEPING_FIELDS:
+        if field in admission:
+            corrected[field] = admission[field]
+    return corrected
+
+
+def correct_note_for_code(
+    note_text: str,
+    code: str,
+    code_context: str,
+    model: str | None = None,
+) -> str:
+    """Revise a clinical note's text so it explicitly reflects a given code.
+
+    Args:
+        note_text: Current note text.
+        code: The code that should be reflected.
+        code_context: LLM-ready clinical context for the code (see
+            get_code_context).
+        model: Optional model override.
+
+    Returns:
+        Revised note text, or the original text unchanged on any failure
+        (LLM error, empty response).
+    """
+    from src.prompts import correction_prompts  # noqa: PLC0415
+
+    prompt = correction_prompts["correct_note_prompt"].substitute(
+        CODE=code,
+        CODE_CONTEXT=code_context,
+        CURRENT_NOTE=note_text,
+    )
+
+    try:
+        revised = call_llm(prompt, model=model, temp=0.4)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Note correction failed for code %s: %s", code, exc)
+        return note_text
+
+    revised = revised.strip()
+    return revised if revised else note_text
 
 
 # ---------------------------------------------------------------------------
