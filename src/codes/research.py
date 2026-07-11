@@ -104,6 +104,13 @@ def _research_code_uncached(
         logger.warning("Code research synthesis failed for %s %s: %s", system.name, code_upper, exc)
         return None
 
+    if not isinstance(parsed, dict):
+        logger.warning(
+            "Code research for %s %s returned non-object JSON (%s), discarding",
+            system.name, code_upper, type(parsed).__name__,
+        )
+        return None
+
     if parsed.get("confidence") == "low":
         logger.info("Code research for %s %s returned low confidence, discarding", system.name, code_upper)
         return None

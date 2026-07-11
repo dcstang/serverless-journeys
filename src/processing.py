@@ -512,7 +512,10 @@ def build_output_info(
         code_reflection_reports: Optional list of per-patient backward-pass
             reflection reports (see check_code_reflected /
             main.step_verify_code_reflection), one dict per patient mapping
-            code -> {'patient':..., 'admission':..., 'journey':..., 'notes':...}.
+            "<role>:<code>" (role is 'diagnostic' or 'procedure', since the
+            same bare code string can appear in both a diagnostic and a
+            procedure code system) -> {'patient':..., 'admission':...,
+            'journey':..., 'notes':...}.
 
     Returns:
         Summary statistics dict.
@@ -542,8 +545,12 @@ def build_output_info(
         reflected_codes = 0
         unreflected_codes: list[str] = []
         for report in code_reflection_reports:
-            for code, result in report.items():
+            for report_key, result in report.items():
                 total_codes += 1
+                # report_key is "<role>:<code>"; the summary's
+                # unreflected_codes list is a user-facing field that predates
+                # the role tag, so strip it back to the bare code here.
+                code = report_key.split(":", 1)[1] if ":" in report_key else report_key
                 if result["admission"] or result["notes"]:
                     reflected_codes += 1
                 else:

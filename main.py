@@ -737,6 +737,30 @@ def step_generate_notes(
     return notes
 
 
+def _select_note_for_correction(notes: list[dict], role: str) -> dict | None:
+    """Pick which note a corrective rewrite should target.
+
+    A procedure code belongs in an 'operation' note if the journey
+    generated one; anything else (including diagnostic codes) falls back
+    to the earliest note, which is typically the admission-defining
+    ED/ward-round note where a diagnosis first gets documented.
+
+    Args:
+        notes: Generated clinical note list.
+        role: 'diagnostic' or 'procedure'.
+
+    Returns:
+        The note dict to correct, or None if notes is empty.
+    """
+    if not notes:
+        return None
+    if role == "procedure":
+        for note in notes:
+            if note.get("note_type") == "operation":
+                return note
+    return notes[0]
+
+
 def step_verify_code_reflection(
     patient: dict,
     admission: dict,
@@ -758,7 +782,7 @@ def step_verify_code_reflection(
     procedure code that drove this admission. For any code not reflected in
     the admission or notes, attempts up to max_correction_attempts targeted
     corrective regenerations (processing.correct_admission_for_code /
-    correct_note_for_code - editing just the admission record and the first
+    correct_note_for_code - editing just the admission record and one
     journey note, not a full patient re-run), re-checking after each
     attempt and stopping early once the code is reflected. `admission` and
     `notes` are mutated in place by any corrections applied. Codes still
@@ -768,8 +792,8 @@ def step_verify_code_reflection(
         patient: Generated patient dict.
         admission: Generated admission dict (mutated in place on correction).
         journey: Generated journey event list.
-        notes: Generated clinical note list (notes[0] mutated in place on
-            correction, if any notes exist).
+        notes: Generated clinical note list (one entry mutated in place on
+            correction, if any notes exist - see _select_note_for_correction).
         diagnostic_codes: Diagnostic codes that drove this admission.
         diagnostic_code_system: Registry key for the diagnostic code system.
         procedure_codes: Procedure codes that drove this admission.
@@ -785,24 +809,29 @@ def step_verify_code_reflection(
 
     Returns:
         Dict mapping each code to its final per-part reflection result
-        (after any corrections).
+        (after any corrections). Keys are "<role>:<code>" (role is
+        'diagnostic' or 'procedure') rather than the bare code, since a
+        diagnostic and procedure code can share the same string (e.g.
+        'J18.1' is a valid key in both the curated ICD-10 and OPCS-4
+        dictionaries) and a bare-code key would silently let one
+        overwrite the other's result.
     """
     processing = mods["processing"]
     report: dict[str, dict[str, bool]] = {}
 
-    all_codes = [(c, diagnostic_code_system) for c in diagnostic_codes] + [
-        (c, procedure_code_system) for c in procedure_codes
+    all_codes = [(c, diagnostic_code_system, "diagnostic") for c in diagnostic_codes] + [
+        (c, procedure_code_system, "procedure") for c in procedure_codes
     ]
 
-    for code, code_system in all_codes:
+    for code, code_system, role in all_codes:
         result = processing.check_code_reflected(code, code_system, patient, admission, journey, notes)
 
         attempts = 0
         while not (result["admission"] or result["notes"]) and attempts < max_correction_attempts:
             attempts += 1
             logger.info(
-                "  Patient %d: correcting code %s (%s), attempt %d/%d",
-                patient_idx, code, code_system, attempts, max_correction_attempts,
+                "  Patient %d: correcting %s code %s (%s), attempt %d/%d",
+                patient_idx, role, code, code_system, attempts, max_correction_attempts,
             )
             code_context = processing.get_code_context(
                 code_system, code, enable_research=enable_code_research, model=model
@@ -810,28 +839,29 @@ def step_verify_code_reflection(
             admission.update(
                 processing.correct_admission_for_code(admission, code, code_context, model=model)
             )
-            if notes:
+            target_note = _select_note_for_correction(notes, role)
+            if target_note is not None:
                 corrected_text = processing.correct_note_for_code(
-                    notes[0]["clean_note_text"], code, code_context, model=model
+                    target_note.get("clean_note_text", ""), code, code_context, model=model
                 )
-                notes[0]["clean_note_text"] = corrected_text
-                notes[0]["raw_blob_content"] = corrected_text
+                target_note["clean_note_text"] = corrected_text
+                target_note["raw_blob_content"] = corrected_text
 
             result = processing.check_code_reflected(
                 code, code_system, patient, admission, journey, notes
             )
 
-        report[code] = result
+        report[f"{role}:{code}"] = result
         if not (result["admission"] or result["notes"]):
             suffix = f" after {attempts} correction attempt(s)" if attempts else ""
             logger.warning(
-                "  Patient %d: code %s (%s) not reflected in admission or notes%s",
-                patient_idx, code, code_system, suffix,
+                "  Patient %d: %s code %s (%s) not reflected in admission or notes%s",
+                patient_idx, role, code, code_system, suffix,
             )
         elif attempts:
             logger.info(
-                "  Patient %d: code %s (%s) reflected after %d correction attempt(s)",
-                patient_idx, code, code_system, attempts,
+                "  Patient %d: %s code %s (%s) reflected after %d correction attempt(s)",
+                patient_idx, role, code, code_system, attempts,
             )
 
     return report

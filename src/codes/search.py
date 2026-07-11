@@ -71,10 +71,16 @@ def search(query: str, num_results: int = 5, timeout: float = 10.0) -> list[dict
         response = httpx.get(endpoint, params=params, timeout=timeout)
         response.raise_for_status()
         data = response.json()
-    except httpx.HTTPError as exc:
+    except (httpx.HTTPError, ValueError) as exc:
+        # ValueError covers response.json() failing to decode a malformed
+        # body even on a 200 status (json.JSONDecodeError is a ValueError
+        # subclass, not an httpx.HTTPError).
         raise SearchUnavailableError(f"Google Custom Search request failed: {exc}") from exc
 
-    items = data.get("items") or []
+    items = data.get("items") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        items = []
+
     return [
         {
             "title": item.get("title", ""),
@@ -82,4 +88,5 @@ def search(query: str, num_results: int = 5, timeout: float = 10.0) -> list[dict
             "link": item.get("link", ""),
         }
         for item in items
+        if isinstance(item, dict)
     ]
