@@ -1,0 +1,70 @@
+# Builds and publishes both container images to GitHub Container Registry
+# (GHCR) on every push to main, so a Nebius (or any other) job can pull
+# ghcr.io/<owner>/<repo>:latest / :latest-gpu without any local build step.
+#
+# One-time manual step after this workflow's first successful run: the
+# published packages default to private even though this repo is public -
+# open the repo's "Packages" tab and set each package's visibility to
+# public, otherwise a job pulling the image needs a registry credential
+# (see --registry-secret / --registry-username in the Nebius job docs).
+name: Build and publish container images
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include:
+          # Hosted-endpoint image (Anthropic/OpenAI/Nebius AI Studio) - no GPU needed.
+          - dockerfile: Dockerfile
+            suffix: ""
+          # Self-contained GPU job image: serves the model locally via vLLM.
+          - dockerfile: Dockerfile.gpu
+            suffix: "-gpu"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          flavor: |
+            suffix=${{ matrix.suffix }},onlatest=true
+          tags: |
+            type=raw,value=latest
+            type=sha,format=long
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.dockerfile }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.dockerfile }}
