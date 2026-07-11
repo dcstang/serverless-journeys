@@ -19,13 +19,11 @@ Environment variables:
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
 import random
 import re
-import string
 import uuid
 from datetime import datetime, timedelta
 from typing import Any
@@ -112,7 +110,7 @@ def call_llm(
     prompt: str,
     model: str | None = None,
     temp: float = 0.7,
-    max_attempts: int = 5,
+    max_attempts: int | None = None,
     chat_history: list[dict] | None = None,
 ) -> str:
     """Call the configured LLM and return the text response.
@@ -125,7 +123,10 @@ def call_llm(
         model: Model identifier. Defaults to claude-sonnet-4-6 (Anthropic) or
                gpt-4o (OpenAI) depending on provider.
         temp: Sampling temperature (0.0 - 1.0). Lower = more deterministic.
-        max_attempts: Maximum number of retry attempts on failure.
+        max_attempts: Maximum number of retry attempts on failure. Defaults
+            to the MAX_LLM_ATTEMPTS env var (or 5), read fresh on each call
+            so CLI/env configuration takes effect without needing to thread
+            a parameter through every generation function.
         chat_history: Optional list of prior message dicts
                       [{'role': 'user'/'assistant', 'content': '...'}].
                       The prompt is appended as the latest user message.
@@ -136,6 +137,9 @@ def call_llm(
     Raises:
         RuntimeError: If all retry attempts fail.
     """
+    if max_attempts is None:
+        max_attempts = int(os.environ.get("MAX_LLM_ATTEMPTS", "5"))
+
     provider = _get_provider()
 
     if provider == "anthropic":
@@ -283,35 +287,6 @@ def _call_nebius(
 
 
 # ---------------------------------------------------------------------------
-# call_llm_async: asynchronous wrapper
-# ---------------------------------------------------------------------------
-
-
-async def call_llm_async(
-    prompt: str,
-    model: str | None = None,
-    temp: float = 0.7,
-    max_attempts: int = 5,
-    chat_history: list[dict] | None = None,
-) -> str:
-    """Async wrapper around call_llm using asyncio.to_thread.
-
-    Args:
-        prompt: The prompt text.
-        model: Optional model override.
-        temp: Sampling temperature.
-        max_attempts: Max retry attempts.
-        chat_history: Optional conversation history.
-
-    Returns:
-        The model's text response.
-    """
-    return await asyncio.to_thread(
-        call_llm, prompt, model, temp, max_attempts, chat_history
-    )
-
-
-# ---------------------------------------------------------------------------
 # JSON parsing utility
 # ---------------------------------------------------------------------------
 
@@ -340,89 +315,8 @@ def parse_llm_json(response: str) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# Data cleaning utilities
-# ---------------------------------------------------------------------------
-
-
-def remove_failures(data: list[Any], failure_value: Any = None) -> list[Any]:
-    """Remove failed/null entries from a list.
-
-    Args:
-        data: List potentially containing None or failure_value entries.
-        failure_value: Additional value to treat as failure.
-
-    Returns:
-        Filtered list with failures removed.
-    """
-    return [item for item in data if item is not None and item != failure_value]
-
-
-def clean_outputs(text: str, cleaning_type: str, model: str | None = None) -> str:
-    """Use the LLM to clean a text output.
-
-    Args:
-        text: Text to clean.
-        cleaning_type: Type of cleaning to perform (see processing_prompts).
-        model: Optional model override.
-
-    Returns:
-        Cleaned text string.
-    """
-    from src.prompts import processing_prompts  # noqa: PLC0415
-
-    prompt = processing_prompts["clean_outputs_prompt"].substitute(
-        CLEANING_TYPE=cleaning_type,
-        VALUE=text,
-    )
-    return call_llm(prompt, model=model, temp=0.3)
-
-
-def clean_int(value: Any, default: int = 0) -> int:
-    """Safely convert a value to integer, returning default on failure.
-
-    Args:
-        value: Value to convert.
-        default: Value to return if conversion fails.
-
-    Returns:
-        Integer value.
-    """
-    if value is None:
-        return default
-    try:
-        return int(float(str(value).strip()))
-    except (ValueError, TypeError):
-        return default
-
-
-# ---------------------------------------------------------------------------
 # Abbreviation and typo augmentation
 # ---------------------------------------------------------------------------
-
-
-def add_abbreviations_to_dict(
-    data: dict[str, Any],
-    sections_to_skip: list[str] | None = None,
-    model: str | None = None,
-) -> dict[str, Any]:
-    """Apply clinical abbreviation augmentation to string values in a dict.
-
-    Args:
-        data: Dict with string values to augment.
-        sections_to_skip: List of keys to skip during augmentation.
-        model: Optional model override.
-
-    Returns:
-        New dict with abbreviated string values.
-    """
-    sections_to_skip = sections_to_skip or []
-    result = {}
-    for key, value in data.items():
-        if key in sections_to_skip or not isinstance(value, str) or len(value) < 50:
-            result[key] = value
-        else:
-            result[key] = add_abbreviations_to_strings(value, model=model)
-    return result
 
 
 def add_abbreviations_to_strings(text: str, model: str | None = None) -> str:
@@ -441,31 +335,6 @@ def add_abbreviations_to_strings(text: str, model: str | None = None) -> str:
         return text
     prompt = processing_prompts["add_abbreviations_prompt"].substitute(TEXT=text)
     return call_llm(prompt, model=model, temp=0.4)
-
-
-def add_typos_to_dict(
-    data: dict[str, Any],
-    sections_to_skip: list[str] | None = None,
-    typo_rate: float = 0.02,
-) -> dict[str, Any]:
-    """Apply realistic typo augmentation to string values in a dict.
-
-    Args:
-        data: Dict with string values to augment.
-        sections_to_skip: List of keys to skip.
-        typo_rate: Approximate proportion of words to introduce typos into.
-
-    Returns:
-        New dict with typo-augmented string values.
-    """
-    sections_to_skip = sections_to_skip or []
-    result = {}
-    for key, value in data.items():
-        if key in sections_to_skip or not isinstance(value, str) or len(value) < 20:
-            result[key] = value
-        else:
-            result[key] = add_typos_to_string(value, typo_rate=typo_rate)
-    return result
 
 
 def add_typos_to_string(text: str, typo_rate: float = 0.02) -> str:
@@ -546,71 +415,9 @@ def combine_template_sections(
     return "\n\n".join(parts)
 
 
-def pop_nested_value(data: dict, key_path: list[str]) -> Any:
-    """Remove and return a value from a nested dict using a key path.
-
-    Args:
-        data: Nested dict to modify.
-        key_path: List of keys forming the path to the value.
-
-    Returns:
-        The removed value, or None if the path does not exist.
-    """
-    if not key_path:
-        return None
-    current = data
-    for key in key_path[:-1]:
-        if not isinstance(current, dict) or key not in current:
-            return None
-        current = current[key]
-    return current.pop(key_path[-1], None)
-
-
-def update_nested_value(data: dict, key_path: list[str], value: Any) -> dict:
-    """Set a value in a nested dict using a key path, creating dicts as needed.
-
-    Args:
-        data: Nested dict to modify (modified in-place).
-        key_path: List of keys forming the path.
-        value: Value to set.
-
-    Returns:
-        The modified dict.
-    """
-    current = data
-    for key in key_path[:-1]:
-        if key not in current or not isinstance(current[key], dict):
-            current[key] = {}
-        current = current[key]
-    current[key_path[-1]] = value
-    return data
-
-
 # ---------------------------------------------------------------------------
 # Patient / admission data utilities
 # ---------------------------------------------------------------------------
-
-
-def combine_patients_and_admissions(
-    patients_df: pd.DataFrame,
-    admissions_df: pd.DataFrame,
-) -> pd.DataFrame:
-    """Merge patient demographics with admission data.
-
-    Args:
-        patients_df: DataFrame with patient records (must have 'person_id').
-        admissions_df: DataFrame with admission records (must have 'patient_id').
-
-    Returns:
-        Merged DataFrame.
-    """
-    return admissions_df.merge(
-        patients_df,
-        left_on="patient_id",
-        right_on="person_id",
-        how="left",
-        suffixes=("_adm", "_pt"),
-    )
 
 
 def clean_patient_details(patient: dict) -> dict:
@@ -647,40 +454,6 @@ def clean_event_details(event: dict) -> dict:
         Cleaned dict safe for string interpolation.
     """
     return clean_patient_details(event)
-
-
-def normalise_array_struct_column(
-    df: pd.DataFrame,
-    column: str,
-    default: Any = None,
-) -> pd.DataFrame:
-    """Normalise a column containing JSON strings or Python objects.
-
-    Attempts to parse string values as JSON; replaces parse failures with
-    the default value.
-
-    Args:
-        df: DataFrame to modify.
-        column: Column name to normalise.
-        default: Value to use when parsing fails.
-
-    Returns:
-        DataFrame with normalised column (modified in-place copy).
-    """
-    df = df.copy()
-
-    def _parse(val: Any) -> Any:
-        if val is None or (isinstance(val, float) and np.isnan(val)):
-            return default
-        if isinstance(val, str):
-            try:
-                return json.loads(val)
-            except (json.JSONDecodeError, ValueError):
-                return default
-        return val
-
-    df[column] = df[column].apply(_parse)
-    return df
 
 
 # ---------------------------------------------------------------------------
@@ -781,101 +554,50 @@ def build_output_info(
             "unreflected_codes": unreflected_codes,
         }
 
+    quality_metrics = average_note_quality_metrics(clinical_notes)
+    if quality_metrics:
+        summary["note_quality_metrics"] = quality_metrics
+
     return summary
 
 
-# ---------------------------------------------------------------------------
-# read_write_data: CSV-based I/O
-# ---------------------------------------------------------------------------
+_QUALITY_METRIC_KEYS = (
+    "flesch_reading_ease",
+    "flesch_kincaid_grade",
+    "gunning_fog",
+    "word_count",
+    "fluency_score",
+    "groundedness_score",
+    "relevance_score",
+)
 
 
-def read_data(
-    file_path: str,
-    schema: dict[str, Any] | None = None,
-) -> pd.DataFrame:
-    """Read a CSV file into a DataFrame, optionally applying a schema.
+def average_note_quality_metrics(clinical_notes: list[list[dict]]) -> dict[str, float]:
+    """Average any quality-evaluation scores (see evaluate_note) present on notes.
+
+    Notes without evaluation scores (evaluation wasn't run, or a metric
+    failed and was left as None) are silently skipped per-metric.
 
     Args:
-        file_path: Absolute or relative path to the CSV file.
-        schema: Optional dtype schema dict (from schemas.py).
+        clinical_notes: List of lists of clinical note dicts.
 
     Returns:
-        DataFrame.
-
-    Raises:
-        FileNotFoundError: If the file does not exist.
+        Dict of avg_<metric> -> mean value, for whichever metrics were
+        present on at least one note. Empty dict if none were evaluated.
     """
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(f"Data file not found: {file_path}")
+    values: dict[str, list[float]] = {key: [] for key in _QUALITY_METRIC_KEYS}
+    for notes in clinical_notes:
+        for note in notes:
+            for key in _QUALITY_METRIC_KEYS:
+                val = note.get(key)
+                if val is not None:
+                    values[key].append(val)
 
-    df = pd.read_csv(file_path, low_memory=False)
-
-    if schema:
-        for col, dtype in schema.items():
-            if col in df.columns:
-                try:
-                    if dtype in ("string",):
-                        df[col] = df[col].astype("string")
-                    elif dtype in ("boolean",):
-                        df[col] = df[col].astype("boolean")
-                    elif dtype in ("Int32", "Int64"):
-                        df[col] = pd.array(df[col], dtype=dtype)
-                    elif dtype in ("datetime64[ns]",):
-                        df[col] = pd.to_datetime(df[col], errors="coerce")
-                    # object columns left as-is
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug(
-                        "Could not cast column %s to %s: %s", col, dtype, exc
-                    )
-    return df
-
-
-def write_data(
-    df: pd.DataFrame,
-    file_path: str,
-    create_dirs: bool = True,
-) -> None:
-    """Write a DataFrame to a CSV file.
-
-    Args:
-        df: DataFrame to write.
-        file_path: Destination file path.
-        create_dirs: If True, create parent directories if they don't exist.
-    """
-    if create_dirs:
-        os.makedirs(os.path.dirname(os.path.abspath(file_path)), exist_ok=True)
-    df.to_csv(file_path, index=False)
-    logger.info("Wrote %d rows to %s", len(df), file_path)
-
-
-def read_write_data(
-    input_path: str | None,
-    output_path: str,
-    processor_fn,
-    schema: dict[str, Any] | None = None,
-) -> pd.DataFrame:
-    """Read data from CSV, apply processor function, write result to CSV.
-
-    This is the main pipeline I/O function. If input_path is None, an empty
-    DataFrame is passed to processor_fn.
-
-    Args:
-        input_path: Path to input CSV (or None for generation-from-scratch).
-        output_path: Path to write output CSV.
-        processor_fn: Callable(df) -> df to apply to the data.
-        schema: Optional dtype schema for input reading.
-
-    Returns:
-        Processed DataFrame.
-    """
-    if input_path and os.path.exists(input_path):
-        df_in = read_data(input_path, schema=schema)
-    else:
-        df_in = pd.DataFrame()
-
-    df_out = processor_fn(df_in)
-    write_data(df_out, output_path)
-    return df_out
+    return {
+        f"avg_{key}": sum(vals) / len(vals)
+        for key, vals in values.items()
+        if vals
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -918,6 +640,8 @@ def generate_from_codes(
     diagnostic_code_system: str = "icd10",
     procedure_code_system: str = "opcs4",
     enable_code_research: bool = False,
+    min_los_days: int = 1,
+    max_los_days: int = 14,
 ) -> dict:
     """Generate an admission record driven by diagnostic and/or procedure codes.
 
@@ -929,7 +653,10 @@ def generate_from_codes(
     new CodeSystem, with no changes required here.
 
     If neither diagnostic_codes nor procedure_codes are given, falls back
-    to a generic emergency admission prompt with a random presentation.
+    to a generic emergency admission prompt with a random presentation,
+    guided by min_los_days/max_los_days (codes with a curated or researched
+    typical_los_days already carry their own LOS guidance, so those bounds
+    only apply to this uncoded fallback path).
 
     Args:
         diagnostic_codes: List of diagnostic codes (may be empty).
@@ -945,6 +672,10 @@ def generate_from_codes(
         enable_code_research: If True, codes with no curated dictionary
             entry are researched via web search before generation (adds
             latency/cost per unique uncurated code - see src/codes/research.py).
+        min_los_days: Minimum length of stay to suggest for the no-codes
+            fallback path (default 1).
+        max_los_days: Maximum length of stay to suggest for the no-codes
+            fallback path (default 14).
 
     Returns:
         Dict containing generated admission data, enriched with
@@ -993,6 +724,8 @@ def generate_from_codes(
             SPECIALTY="General Medicine",
             ADMISSION_DATE=admission_date,
             ADMISSION_TIME=admission_time,
+            MIN_LOS_DAYS=str(min_los_days),
+            MAX_LOS_DAYS=str(max_los_days),
         )
 
     response = call_llm(prompt, model=model, temp=0.8)
@@ -1437,3 +1170,146 @@ def generate_clinical_note(
     )
 
     return call_llm(prompt, model=model, temp=0.85)
+
+
+# ---------------------------------------------------------------------------
+# Quality evaluation metrics
+# ---------------------------------------------------------------------------
+
+
+def calculate_readability_metrics(note_text: str) -> dict[str, Any]:
+    """Compute objective readability metrics for a note (no LLM call).
+
+    Args:
+        note_text: Clinical note text.
+
+    Returns:
+        Dict with flesch_reading_ease, flesch_kincaid_grade, gunning_fog,
+        and word_count, or an empty dict if note_text is blank.
+    """
+    if not note_text or not note_text.strip():
+        return {}
+
+    import textstat  # noqa: PLC0415
+
+    return {
+        "flesch_reading_ease": textstat.flesch_reading_ease(note_text),
+        "flesch_kincaid_grade": textstat.flesch_kincaid_grade(note_text),
+        "gunning_fog": textstat.gunning_fog(note_text),
+        "word_count": textstat.lexicon_count(note_text),
+    }
+
+
+def calculate_fluency(note_text: str, model: str | None = None) -> dict[str, Any]:
+    """LLM-judged linguistic fluency of a note (grammar, register, coherence).
+
+    Args:
+        note_text: Clinical note text.
+        model: Optional model override.
+
+    Returns:
+        Parsed JSON dict per evaluation_prompts['calculate_fluency_prompt']
+        (fluency_score, grammar_score, clinical_register_score, etc.).
+    """
+    from src.prompts import evaluation_prompts  # noqa: PLC0415
+
+    prompt = evaluation_prompts["calculate_fluency_prompt"].substitute(NOTE=note_text)
+    response = call_llm(prompt, model=model, temp=0.2)
+    return parse_llm_json(response)
+
+
+def calculate_groundedness(note_text: str, reference_material: str, model: str | None = None) -> dict[str, Any]:
+    """LLM-judged groundedness of a note against its reference context.
+
+    Args:
+        note_text: Clinical note text.
+        reference_material: Reference context (e.g. admission/patient JSON)
+            the note should be factually consistent with.
+        model: Optional model override.
+
+    Returns:
+        Parsed JSON dict per evaluation_prompts['calculate_groundedness_prompt']
+        (groundedness_score, is_grounded, hallucinations, etc.).
+    """
+    from src.prompts import evaluation_prompts  # noqa: PLC0415
+
+    prompt = evaluation_prompts["calculate_groundedness_prompt"].substitute(
+        NOTE=note_text, REFERENCE=reference_material
+    )
+    response = call_llm(prompt, model=model, temp=0.2)
+    return parse_llm_json(response)
+
+
+def calculate_relevance(note_text: str, reference_material: str, model: str | None = None) -> dict[str, Any]:
+    """LLM-judged clinical relevance of a note to its stated context.
+
+    Args:
+        note_text: Clinical note text.
+        reference_material: Reference context (e.g. admission/patient JSON)
+            the note's content should be relevant to.
+        model: Optional model override.
+
+    Returns:
+        Parsed JSON dict per evaluation_prompts['calculate_relevance_prompt']
+        (relevance_score, is_relevant, missing_elements, etc.).
+    """
+    from src.prompts import evaluation_prompts  # noqa: PLC0415
+
+    prompt = evaluation_prompts["calculate_relevance_prompt"].substitute(
+        NOTE=note_text, REFERENCE=reference_material
+    )
+    response = call_llm(prompt, model=model, temp=0.2)
+    return parse_llm_json(response)
+
+
+def evaluate_note(
+    note_text: str,
+    reference_material: str,
+    model: str | None = None,
+) -> dict[str, Any]:
+    """Evaluate a generated note: objective readability plus LLM-judged
+    fluency/groundedness/relevance.
+
+    Combines calculate_readability_metrics (free, always computed) with
+    calculate_fluency/calculate_groundedness/calculate_relevance (3 LLM
+    calls - meant to be gated behind an opt-in flag by callers, since this
+    triples the LLM cost per note evaluated). Returns a flat dict so the
+    scores can be merged directly onto a note record and flow straight
+    into CSV output as extra columns. Any individual metric that fails to
+    compute is set to None rather than aborting the whole evaluation.
+
+    Args:
+        note_text: Clinical note text to evaluate.
+        reference_material: Reference context (e.g. admission/patient JSON)
+            to check groundedness/relevance against.
+        model: Optional model override.
+
+    Returns:
+        Flat dict: readability keys plus fluency_score, groundedness_score,
+        relevance_score.
+    """
+    metrics: dict[str, Any] = calculate_readability_metrics(note_text)
+
+    try:
+        metrics["fluency_score"] = calculate_fluency(note_text, model=model).get("fluency_score")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Fluency evaluation failed: %s", exc)
+        metrics["fluency_score"] = None
+
+    try:
+        metrics["groundedness_score"] = calculate_groundedness(
+            note_text, reference_material, model=model
+        ).get("groundedness_score")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Groundedness evaluation failed: %s", exc)
+        metrics["groundedness_score"] = None
+
+    try:
+        metrics["relevance_score"] = calculate_relevance(
+            note_text, reference_material, model=model
+        ).get("relevance_score")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Relevance evaluation failed: %s", exc)
+        metrics["relevance_score"] = None
+
+    return metrics

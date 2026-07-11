@@ -46,6 +46,10 @@ Environment variables (override CLI args or provide defaults):
     RESEARCH_UNKNOWN_CODES  - 'true' to research uncurated codes via web search
     GOOGLE_SEARCH_API_KEY   - required if RESEARCH_UNKNOWN_CODES is enabled
     GOOGLE_SEARCH_CSE_ID    - required if RESEARCH_UNKNOWN_CODES is enabled
+    N_EVENTS_PER_PATIENT    - approximate journey events per patient (soft target), default 8
+    TYPO_RATE               - proportion of words to corrupt when APPLY_TYPOS is set, default 0.02
+    MAX_LLM_ATTEMPTS        - retry attempts per LLM call, default 5
+    MIN_LOS_DAYS/MAX_LOS_DAYS - suggested LOS range for no-codes random admissions, default 1/14
     OUTPUT_DIR              - output directory path
 """
 
@@ -55,11 +59,9 @@ import argparse
 import json
 import logging
 import os
-import random
 import sys
 import uuid
-from datetime import datetime, timedelta
-from pathlib import Path
+from datetime import datetime
 from typing import Any
 
 # Load .env file if present (development convenience)
@@ -94,7 +96,6 @@ def _import_project_modules():
     modules: dict[str, Any] = {}
 
     try:
-        modules["params"] = importlib.import_module("config.params")
         modules["config"] = importlib.import_module("config.config")
         modules["processing"] = importlib.import_module("src.processing")
         # Importing icd10/opcs4 registers them as CodeSystems (see
@@ -250,6 +251,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--evaluate-notes",
+        action="store_true",
+        default=os.environ.get("EVALUATE_NOTES", "false").lower() == "true",
+        help=(
+            "Score generated notes after generation completes: objective readability "
+            "(free) plus LLM-judged fluency/groundedness/relevance (3 extra LLM calls "
+            "per note). Scores are attached as extra columns on each note and averaged "
+            "into generation_summary.json / the run summary. Off by default."
+        ),
+    )
+    parser.add_argument(
         "--apply-abbreviations",
         action="store_true",
         default=os.environ.get("APPLY_ABBREVIATIONS", "false").lower() == "true",
@@ -260,6 +272,36 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         default=os.environ.get("APPLY_TYPOS", "false").lower() == "true",
         help="Apply realistic typo augmentation to generated notes.",
+    )
+    parser.add_argument(
+        "--typo-rate",
+        type=float,
+        default=float(os.environ.get("TYPO_RATE", "0.02")),
+        help="Approximate proportion of words to corrupt when --apply-typos is set (default: 0.02).",
+    )
+    parser.add_argument(
+        "--max-llm-attempts",
+        type=int,
+        default=int(os.environ.get("MAX_LLM_ATTEMPTS", "5")),
+        help="Max retry attempts per LLM call before giving up (default: 5).",
+    )
+    parser.add_argument(
+        "--min-los-days",
+        type=int,
+        default=int(os.environ.get("MIN_LOS_DAYS", "1")),
+        help=(
+            "Minimum length of stay (days) suggested to the LLM for randomly generated "
+            "admissions when no diagnostic/procedure codes are given (default: 1)."
+        ),
+    )
+    parser.add_argument(
+        "--max-los-days",
+        type=int,
+        default=int(os.environ.get("MAX_LOS_DAYS", "14")),
+        help=(
+            "Maximum length of stay (days) suggested to the LLM for randomly generated "
+            "admissions when no diagnostic/procedure codes are given (default: 14)."
+        ),
     )
     parser.add_argument(
         "--admission-date",
@@ -469,6 +511,8 @@ def step_generate_admission(
     model: str | None,
     test_mode: bool,
     enable_code_research: bool = False,
+    min_los_days: int = 1,
+    max_los_days: int = 14,
 ) -> dict:
     """Generate an admission record for a patient.
 
@@ -484,6 +528,8 @@ def step_generate_admission(
         test_mode: If True, return stub data.
         enable_code_research: If True, research uncurated codes via web
             search before generation (see src.codes.research).
+        min_los_days: Minimum LOS to suggest when no codes are given.
+        max_los_days: Maximum LOS to suggest when no codes are given.
 
     Returns:
         Admission details dict.
@@ -506,6 +552,8 @@ def step_generate_admission(
         diagnostic_code_system=diagnostic_code_system,
         procedure_code_system=procedure_code_system,
         enable_code_research=enable_code_research,
+        min_los_days=min_los_days,
+        max_los_days=max_los_days,
     )
     admission["admission_id"] = str(uuid.uuid4())
     admission["patient_id"] = patient.get("person_id", str(uuid.uuid4()))
@@ -579,6 +627,7 @@ def step_generate_notes(
     test_mode: bool,
     apply_abbreviations: bool,
     apply_typos: bool,
+    typo_rate: float = 0.02,
 ) -> list[dict]:
     """Generate clinical notes for each event in a patient journey.
 
@@ -591,6 +640,7 @@ def step_generate_notes(
         test_mode: If True, return stub notes.
         apply_abbreviations: Whether to apply abbreviation augmentation.
         apply_typos: Whether to apply typo augmentation.
+        typo_rate: Approximate proportion of words to corrupt when apply_typos is True.
 
     Returns:
         List of clinical note dicts.
@@ -664,7 +714,7 @@ def step_generate_notes(
 
             if apply_typos and len(note_text) > 100:
                 try:
-                    note_text = mods["processing"].add_typos_to_string(note_text)
+                    note_text = mods["processing"].add_typos_to_string(note_text, typo_rate=typo_rate)
                 except Exception as exc:  # noqa: BLE001
                     logger.debug("Typo augmentation failed: %s", exc)
 
@@ -787,6 +837,45 @@ def step_verify_code_reflection(
     return report
 
 
+def step_evaluate_notes(
+    admission: dict,
+    patient: dict,
+    notes: list[dict],
+    mods: dict,
+    model: str | None,
+) -> None:
+    """Score each note's readability and (LLM-judged) fluency/groundedness/
+    relevance, attaching the scores directly onto the note record.
+
+    Runs after any correction (step_verify_code_reflection) so it scores
+    the final note text, not a pre-correction draft. Mutates each dict in
+    `notes` in place by merging in the extra score columns - failures on
+    an individual note are logged and leave that note's scores as None
+    rather than aborting the whole patient.
+
+    Args:
+        admission: Generated admission dict, used as reference material
+            for groundedness/relevance judging.
+        patient: Generated patient dict, included in reference material.
+        notes: Generated clinical note list (mutated in place).
+        mods: Module namespace dict.
+        model: Optional LLM model override.
+    """
+    processing = mods["processing"]
+    reference_material = json.dumps(
+        {"patient": patient, "admission": admission}, indent=2, default=str
+    )
+
+    for note in notes:
+        try:
+            scores = processing.evaluate_note(
+                note.get("clean_note_text", ""), reference_material, model=model
+            )
+            note.update(scores)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("  Note evaluation failed for note %s: %s", note.get("clinical_note_id"), exc)
+
+
 # ---------------------------------------------------------------------------
 # Output helpers
 # ---------------------------------------------------------------------------
@@ -883,6 +972,7 @@ def print_summary(
     all_notes: list[list[dict]],
     all_code_reflection_reports: list[dict],
     output_dir: str,
+    mods: dict,
 ) -> None:
     """Print a human-readable summary of the generation run to stdout.
 
@@ -894,6 +984,7 @@ def print_summary(
         all_code_reflection_reports: List of per-patient code reflection
             check reports (see step_verify_code_reflection).
         output_dir: Output directory path.
+        mods: Module namespace dict.
     """
     total_events = sum(len(j) for j in all_journeys)
     total_notes = sum(len(n) for n in all_notes)
@@ -935,6 +1026,12 @@ def print_summary(
         if reflected_codes < total_codes:
             print("  See generation_summary.json / logs for codes that weren't reflected.")
 
+    quality_metrics = mods["processing"].average_note_quality_metrics(all_notes)
+    if quality_metrics:
+        print(f"\nNote quality metrics (averages):")
+        for key, value in sorted(quality_metrics.items()):
+            print(f"  {key:<28} {value:.2f}")
+
     print(f"\nOutput directory: {os.path.abspath(output_dir)}")
     print("=" * 60 + "\n")
 
@@ -965,6 +1062,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
     os.environ["LLM_PROVIDER"] = args.llm_provider
     if args.model:
         os.environ["MODEL"] = args.model
+    os.environ["MAX_LLM_ATTEMPTS"] = str(args.max_llm_attempts)
 
     # Import project modules
     try:
@@ -1015,6 +1113,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
                 procedure_codes, procedure_code_system,
                 admission_date, mods, model, args.test_mode,
                 args.research_unknown_codes,
+                args.min_los_days, args.max_los_days,
             )
 
             # Step 3: Generate patient journey
@@ -1030,7 +1129,8 @@ def run_pipeline(args: argparse.Namespace) -> int:
             )
             notes = step_generate_notes(
                 patient, admission, journey, mods, model,
-                args.test_mode, args.apply_abbreviations, args.apply_typos
+                args.test_mode, args.apply_abbreviations, args.apply_typos,
+                args.typo_rate,
             )
 
             # Step 5: Backward-pass check (+ targeted correction on a miss) -
@@ -1047,6 +1147,11 @@ def run_pipeline(args: argparse.Namespace) -> int:
                 )
                 admission["code_reflection_check"] = reflection_report
                 all_code_reflection_reports.append(reflection_report)
+
+            # Step 6: Quality evaluation (opt-in) - scores the final note
+            # text, after any correction above.
+            if not args.test_mode and args.evaluate_notes:
+                step_evaluate_notes(admission, patient, notes, mods, model)
 
             all_patients.append(patient)
             all_admissions.append(admission)
@@ -1084,7 +1189,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
     # Print summary
     print_summary(
         all_patients, all_admissions, all_journeys, all_notes,
-        all_code_reflection_reports, args.output_dir
+        all_code_reflection_reports, args.output_dir, mods
     )
 
     logger.info("Pipeline completed successfully.")
