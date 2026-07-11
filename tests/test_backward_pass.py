@@ -68,7 +68,10 @@ class TestCheckProcedureReflected:
     """Mirrors TestCheckDiagnosisReflected for OPCS-4 procedure codes."""
 
     def test_flags_all_four_parts_as_reflected_when_present(self):
-        patient = {"past_medical_and_surgical_history": ["Previous coronary artery bypass grafting in 2019"]}
+        # OPCS-4 has no curated entries (see code_systems/opcs4.json), so
+        # matching relies on the bare code appearing in each part rather
+        # than curated-description keywords.
+        patient = {"past_medical_and_surgical_history": ["Previous CABG (K40.1) in 2019"]}
         admission = {
             "planned_procedure": "K40.1 - Coronary artery bypass grafting using saphenous vein graft"
         }
@@ -175,7 +178,12 @@ class TestForwardAndBackwardPassIntegration:
         driven through the opcs4-only prompt path and checked with
         check_procedure_reflected instead of check_diagnosis_reflected."""
         code = "K40.1"
-        description = opcs4.lookup_code(code)["description"]
+        # OPCS-4 has no curated entries (see code_systems/opcs4.json), so
+        # check_procedure_reflected now matches only on the bare code
+        # rather than description keywords - each generated part below
+        # includes the literal code, mirroring what an LLM would produce
+        # from the generic uncurated-code prompt context.
+        description = "coronary artery bypass grafting"
 
         def fake_call_llm(prompt, model=None, temp=0.7, **kwargs):
             if "Return ONLY a valid JSON array" in prompt:
@@ -186,7 +194,7 @@ class TestForwardAndBackwardPassIntegration:
                             "event_date": "2026-07-08",
                             "event_time": "08:00",
                             "event_order": 1,
-                            "brief_description": f"Patient undergoes {description}",
+                            "brief_description": f"Patient undergoes {description} ({code})",
                             "clinician_type": "Consultant Cardiac Surgeon",
                         }
                     ]
@@ -196,7 +204,7 @@ class TestForwardAndBackwardPassIntegration:
             return json.dumps(
                 {
                     "admission_type": "elective",
-                    "planned_procedure": description,
+                    "planned_procedure": f"{code} - {description}",
                     "indication": f"Elective {description}",
                     "estimated_los_days": 8,
                 }

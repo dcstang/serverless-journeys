@@ -153,7 +153,10 @@ class TestForwardPassProcedureOnly:
 
         prompt = captured["prompt"]
         assert "K40.1" in prompt
-        assert "Coronary artery bypass grafting using saphenous vein graft" in prompt
+        # OPCS-4 has no curated entries (see code_systems/opcs4.json), so
+        # the forward pass falls back to the generic procedure-code
+        # context rather than a curated description.
+        assert "OPCS-4 K40.1" in prompt
 
     def test_admission_dict_carries_input_codes_and_system_forward(self, monkeypatch, sample_patient):
         monkeypatch.setattr(

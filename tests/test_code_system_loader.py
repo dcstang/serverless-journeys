@@ -208,9 +208,15 @@ class TestBootstrapDefaultCodeSystems:
         assert registry.get_code_system("icd10").name == "Overridden ICD-10"
 
 
-class TestBuiltInDataFilesMatchPreviousCuratedContent:
-    """Guards against data loss/corruption in the icd10.py/opcs4.py ->
-    code_systems/*.json conversion - spot-checks a few known entries."""
+class TestBuiltInDataFiles:
+    """Guards against data loss/corruption in code_systems/icd10.json -
+    spot-checks a known entry (verified against the NHS's official ICD-10
+    5th Edition tabular list). code_systems/opcs4.json is intentionally
+    empty: an audit against the NHS's official OPCS-4 tabular list found
+    most of the original curated entries pointed at the wrong procedure
+    entirely, so the bad data was removed pending proper curation rather
+    than left in place - see the registry docstring on empty `codes`
+    dicts being a valid, fully-supported uncurated standard."""
 
     def test_icd10_json_has_expected_sample_entry(self):
         from src.codes import icd10
@@ -223,18 +229,11 @@ class TestBuiltInDataFilesMatchPreviousCuratedContent:
         assert info["specialty"] == "Cardiology"
         assert info["typical_los_days"] == [4, 7]
 
-    def test_opcs4_json_has_expected_sample_entry(self):
-        from src.codes import opcs4
-
-        info = opcs4.lookup_code("K40.1")
-        assert info is not None
-        assert info["description"] == "Coronary artery bypass grafting using saphenous vein graft"
-        assert info["surgical_specialty"] == "Cardiac Surgery"
-
     def test_icd10_code_count_matches_original(self):
         system = registry.get_code_system("icd10")
         assert len(system.codes) == 75
 
-    def test_opcs4_code_count_matches_original(self):
+    def test_opcs4_is_registered_with_no_curated_codes(self):
         system = registry.get_code_system("opcs4")
-        assert len(system.codes) == 57
+        assert system.kind == "procedure"
+        assert system.codes == {}
