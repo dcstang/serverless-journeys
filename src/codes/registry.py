@@ -135,14 +135,13 @@ def infer_specialty(system: CodeSystem, code: str) -> str:
     """
     info = lookup_code(system, code)
     if info:
-        raw = str(info.get(system.specialty_field, system.default_specialty))
-        return raw.split("/")[0].strip()
+        return str(info.get(system.specialty_field, system.default_specialty))
 
+    code = code.strip().upper()
     if not code:
         return system.default_specialty
 
-    chapter_letter = code.strip().upper()[0]
-    return system.chapter_map.get(chapter_letter, system.default_specialty)
+    return system.chapter_map.get(code[0], system.default_specialty)
 
 
 def format_code_context(system: CodeSystem, code: str, info: dict) -> str:
@@ -163,6 +162,7 @@ def format_code_context(system: CodeSystem, code: str, info: dict) -> str:
     code_upper = code.strip().upper()
     description = info.get("description", code_upper)
     specialty = info.get(system.specialty_field, system.default_specialty)
+    chapter_name = info.get("chapter_name")
     los = info.get("typical_los_days")
     type_word = info.get(system.type_field) if system.type_field else None
 
@@ -170,6 +170,8 @@ def format_code_context(system: CodeSystem, code: str, info: dict) -> str:
     if type_word:
         article = "an" if str(type_word)[0].lower() in "aeiou" else "a"
         parts.append(f"This patient is being managed as {article} {type_word} case.")
+    if chapter_name:
+        parts.append(f"Chapter: {chapter_name}.")
     parts.append(f"Specialty: {specialty}.")
     if los:
         low, high = los
@@ -200,11 +202,20 @@ def get_clinical_context(system: CodeSystem, code: str) -> str:
 
     if info is None:
         kind_word = "diagnosis" if system.kind == "diagnostic" else "procedure"
-        return (
+        message = (
             f"{system.name} {code_upper}: Code not found in reference dictionary. "
             f"Treat this as a {kind_word} code from the {system.name} standard and "
             f"generate clinically appropriate NHS documentation for it, following "
-            f"standard UK clinical practice and NHS documentation conventions."
+            f"standard UK clinical practice and NHS documentation conventions"
         )
+        if system.kind == "procedure":
+            message += (
+                ", including pre-operative assessment (fitness for anaesthesia, "
+                "consent, WHO surgical checklist), intra-operative findings, and "
+                "post-operative care plan as per NHS surgical pathway standards."
+            )
+        else:
+            message += "."
+        return message
 
     return format_code_context(system, code_upper, info)

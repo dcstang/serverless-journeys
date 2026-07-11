@@ -890,7 +890,19 @@ def correct_note_for_code(
 # confirm the code made it into the *clinical narrative*, not just that it
 # was echoed back as metadata.
 _ADMISSION_CODE_BOOKKEEPING_FIELDS = frozenset(
-    {"diagnostic_codes", "diagnostic_code_system", "procedure_codes", "procedure_code_system"}
+    {
+        "diagnostic_codes",
+        "diagnostic_code_system",
+        "procedure_codes",
+        "procedure_code_system",
+        # main.py attaches the reflection report itself onto the admission
+        # dict for output purposes. It's JSON-serialised code metadata, not
+        # clinical narrative, so it must stay excluded here too - otherwise
+        # a later reflection check against the same admission would
+        # trivially "pass" by matching a code string embedded in a
+        # *previous* check's own report rather than the actual narrative.
+        "code_reflection_check",
+    }
 )
 
 
