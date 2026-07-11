@@ -1,6 +1,13 @@
-# Synthetic NHS Patient Journeys, One Serverless GPU Job at a Time
+# Boomerang: Synthetic NHS Patient Journeys That Check Themselves on the Way Back
 
 *Built for the Nebius hackathon*
+
+![Boomerang cover](assets/boomerang-cover.png)
+
+Every record this project generates goes out as a forward pass —
+patient, admission, journey, notes — and comes back as a backward pass
+that verifies the driving codes actually landed, correcting anything
+that didn't. Out and back, like a boomerang. That's the name.
 
 ## The problem
 

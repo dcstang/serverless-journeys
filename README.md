@@ -1,4 +1,8 @@
-# serverless-journeys
+# Boomerang
+
+![Boomerang cover](assets/boomerang-cover.png)
+
+*(formerly `serverless-journeys`)*
 
 Generate synthetic NHS patient journeys — demographics, admissions, event
 timelines, and clinical notes — driven by real diagnostic and procedure
