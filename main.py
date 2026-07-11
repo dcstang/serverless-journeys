@@ -98,9 +98,12 @@ def _import_project_modules():
     try:
         modules["config"] = importlib.import_module("config.config")
         modules["processing"] = importlib.import_module("src.processing")
-        # Importing icd10/opcs4 registers them as CodeSystems (see
-        # src/codes/registry.py) - keep these imports even though this
-        # module mostly talks to the generic registry from here on.
+        # Importing anything under src.codes runs src/codes/__init__.py,
+        # which discovers and registers every CodeSystem from code_systems/
+        # *.json (plus $EXTRA_CODE_SYSTEMS_DIR, if set) - see
+        # src/codes/loader.py. icd10/opcs4 are kept here as convenience
+        # wrapper modules even though this file mostly talks to the
+        # generic registry from here on.
         modules["icd10"] = importlib.import_module("src.codes.icd10")
         modules["opcs4"] = importlib.import_module("src.codes.opcs4")
         modules["registry"] = importlib.import_module("src.codes.registry")
@@ -152,9 +155,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=os.environ.get("DIAGNOSTIC_CODE_SYSTEM", "icd10"),
         help=(
             "Coding standard the --diagnostic-codes belong to (default: 'icd10'). "
-            "Any system registered in src/codes/registry.py may be used - see "
-            "that module for how to add support for another standard (e.g. "
-            "ICD-11, SNOMED CT)."
+            "Any system with a JSON file under code_systems/ (or "
+            "$EXTRA_CODE_SYSTEMS_DIR) may be used - see src/codes/loader.py "
+            "for the file format to add another standard (e.g. ICD-11, SNOMED CT)."
         ),
     )
     parser.add_argument(
@@ -172,8 +175,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=os.environ.get("PROCEDURE_CODE_SYSTEM", "opcs4"),
         help=(
             "Coding standard the --procedure-codes belong to (default: 'opcs4'). "
-            "Any system registered in src/codes/registry.py may be used (e.g. "
-            "CPT, HCPCS)."
+            "Any system with a JSON file under code_systems/ (or "
+            "$EXTRA_CODE_SYSTEMS_DIR) may be used (e.g. CPT, HCPCS)."
         ),
     )
     parser.add_argument(

@@ -8,18 +8,21 @@ ICD-9-CM in older datasets, and so on.
 A CodeSystem is a small, uniform description of one such standard: its
 curated code -> metadata dictionary (if any), which field in that metadata
 holds the specialty, and a first-letter fallback map for codes outside the
-curated set. src/codes/icd10.py and src/codes/opcs4.py build a CodeSystem
-from their existing dictionaries and register it here at import time.
+curated set.
 
-To add support for another standard (say, SNOMED CT), build a CodeSystem
-the same way in a new module and call register_code_system() - the rest of
-the pipeline (prompt generation in src/processing.py, the CLI's
---diagnostic-code-system / --procedure-code-system flags, and the
-backward-pass reflection checks) then works with it automatically, with no
-further code changes required. A system with an empty `codes` dict is also
-valid: every lookup falls back to the generic "not in curated dictionary"
-path, so an entirely uncurated standard still works end to end - the LLM
-just generates purely from the raw code with no extra clinical context.
+register_code_system() is the only thing that gets a CodeSystem into this
+registry - this module doesn't care where one comes from. In practice
+nearly every CodeSystem is built by src/codes/loader.py from a data-only
+JSON file under code_systems/ (see that module's docstring for the file
+schema), which is what makes adding a standard a no-code, data-only
+contribution - the rest of the pipeline (prompt generation in
+src/processing.py, the CLI's --diagnostic-code-system /
+--procedure-code-system flags, and the backward-pass reflection checks)
+then works with it automatically. A system with an empty `codes` dict is
+also valid: every lookup falls back to the generic "not in curated
+dictionary" path, so an entirely uncurated standard still works end to end
+- the LLM just generates purely from the raw code with no extra clinical
+context.
 """
 
 from __future__ import annotations
