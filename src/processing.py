@@ -19,13 +19,11 @@ Environment variables:
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
 import random
 import re
-import string
 import uuid
 from datetime import datetime, timedelta
 from typing import Any
@@ -112,7 +110,7 @@ def call_llm(
     prompt: str,
     model: str | None = None,
     temp: float = 0.7,
-    max_attempts: int = 5,
+    max_attempts: int | None = None,
     chat_history: list[dict] | None = None,
 ) -> str:
     """Call the configured LLM and return the text response.
@@ -125,7 +123,10 @@ def call_llm(
         model: Model identifier. Defaults to claude-sonnet-4-6 (Anthropic) or
                gpt-4o (OpenAI) depending on provider.
         temp: Sampling temperature (0.0 - 1.0). Lower = more deterministic.
-        max_attempts: Maximum number of retry attempts on failure.
+        max_attempts: Maximum number of retry attempts on failure. Defaults
+            to the MAX_LLM_ATTEMPTS env var (or 5), read fresh on each call
+            so CLI/env configuration takes effect without needing to thread
+            a parameter through every generation function.
         chat_history: Optional list of prior message dicts
                       [{'role': 'user'/'assistant', 'content': '...'}].
                       The prompt is appended as the latest user message.
@@ -136,6 +137,9 @@ def call_llm(
     Raises:
         RuntimeError: If all retry attempts fail.
     """
+    if max_attempts is None:
+        max_attempts = int(os.environ.get("MAX_LLM_ATTEMPTS", "5"))
+
     provider = _get_provider()
 
     if provider == "anthropic":
@@ -283,35 +287,6 @@ def _call_nebius(
 
 
 # ---------------------------------------------------------------------------
-# call_llm_async: asynchronous wrapper
-# ---------------------------------------------------------------------------
-
-
-async def call_llm_async(
-    prompt: str,
-    model: str | None = None,
-    temp: float = 0.7,
-    max_attempts: int = 5,
-    chat_history: list[dict] | None = None,
-) -> str:
-    """Async wrapper around call_llm using asyncio.to_thread.
-
-    Args:
-        prompt: The prompt text.
-        model: Optional model override.
-        temp: Sampling temperature.
-        max_attempts: Max retry attempts.
-        chat_history: Optional conversation history.
-
-    Returns:
-        The model's text response.
-    """
-    return await asyncio.to_thread(
-        call_llm, prompt, model, temp, max_attempts, chat_history
-    )
-
-
-# ---------------------------------------------------------------------------
 # JSON parsing utility
 # ---------------------------------------------------------------------------
 
@@ -340,89 +315,8 @@ def parse_llm_json(response: str) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# Data cleaning utilities
-# ---------------------------------------------------------------------------
-
-
-def remove_failures(data: list[Any], failure_value: Any = None) -> list[Any]:
-    """Remove failed/null entries from a list.
-
-    Args:
-        data: List potentially containing None or failure_value entries.
-        failure_value: Additional value to treat as failure.
-
-    Returns:
-        Filtered list with failures removed.
-    """
-    return [item for item in data if item is not None and item != failure_value]
-
-
-def clean_outputs(text: str, cleaning_type: str, model: str | None = None) -> str:
-    """Use the LLM to clean a text output.
-
-    Args:
-        text: Text to clean.
-        cleaning_type: Type of cleaning to perform (see processing_prompts).
-        model: Optional model override.
-
-    Returns:
-        Cleaned text string.
-    """
-    from src.prompts import processing_prompts  # noqa: PLC0415
-
-    prompt = processing_prompts["clean_outputs_prompt"].substitute(
-        CLEANING_TYPE=cleaning_type,
-        VALUE=text,
-    )
-    return call_llm(prompt, model=model, temp=0.3)
-
-
-def clean_int(value: Any, default: int = 0) -> int:
-    """Safely convert a value to integer, returning default on failure.
-
-    Args:
-        value: Value to convert.
-        default: Value to return if conversion fails.
-
-    Returns:
-        Integer value.
-    """
-    if value is None:
-        return default
-    try:
-        return int(float(str(value).strip()))
-    except (ValueError, TypeError):
-        return default
-
-
-# ---------------------------------------------------------------------------
 # Abbreviation and typo augmentation
 # ---------------------------------------------------------------------------
-
-
-def add_abbreviations_to_dict(
-    data: dict[str, Any],
-    sections_to_skip: list[str] | None = None,
-    model: str | None = None,
-) -> dict[str, Any]:
-    """Apply clinical abbreviation augmentation to string values in a dict.
-
-    Args:
-        data: Dict with string values to augment.
-        sections_to_skip: List of keys to skip during augmentation.
-        model: Optional model override.
-
-    Returns:
-        New dict with abbreviated string values.
-    """
-    sections_to_skip = sections_to_skip or []
-    result = {}
-    for key, value in data.items():
-        if key in sections_to_skip or not isinstance(value, str) or len(value) < 50:
-            result[key] = value
-        else:
-            result[key] = add_abbreviations_to_strings(value, model=model)
-    return result
 
 
 def add_abbreviations_to_strings(text: str, model: str | None = None) -> str:
@@ -441,31 +335,6 @@ def add_abbreviations_to_strings(text: str, model: str | None = None) -> str:
         return text
     prompt = processing_prompts["add_abbreviations_prompt"].substitute(TEXT=text)
     return call_llm(prompt, model=model, temp=0.4)
-
-
-def add_typos_to_dict(
-    data: dict[str, Any],
-    sections_to_skip: list[str] | None = None,
-    typo_rate: float = 0.02,
-) -> dict[str, Any]:
-    """Apply realistic typo augmentation to string values in a dict.
-
-    Args:
-        data: Dict with string values to augment.
-        sections_to_skip: List of keys to skip.
-        typo_rate: Approximate proportion of words to introduce typos into.
-
-    Returns:
-        New dict with typo-augmented string values.
-    """
-    sections_to_skip = sections_to_skip or []
-    result = {}
-    for key, value in data.items():
-        if key in sections_to_skip or not isinstance(value, str) or len(value) < 20:
-            result[key] = value
-        else:
-            result[key] = add_typos_to_string(value, typo_rate=typo_rate)
-    return result
 
 
 def add_typos_to_string(text: str, typo_rate: float = 0.02) -> str:
@@ -546,71 +415,9 @@ def combine_template_sections(
     return "\n\n".join(parts)
 
 
-def pop_nested_value(data: dict, key_path: list[str]) -> Any:
-    """Remove and return a value from a nested dict using a key path.
-
-    Args:
-        data: Nested dict to modify.
-        key_path: List of keys forming the path to the value.
-
-    Returns:
-        The removed value, or None if the path does not exist.
-    """
-    if not key_path:
-        return None
-    current = data
-    for key in key_path[:-1]:
-        if not isinstance(current, dict) or key not in current:
-            return None
-        current = current[key]
-    return current.pop(key_path[-1], None)
-
-
-def update_nested_value(data: dict, key_path: list[str], value: Any) -> dict:
-    """Set a value in a nested dict using a key path, creating dicts as needed.
-
-    Args:
-        data: Nested dict to modify (modified in-place).
-        key_path: List of keys forming the path.
-        value: Value to set.
-
-    Returns:
-        The modified dict.
-    """
-    current = data
-    for key in key_path[:-1]:
-        if key not in current or not isinstance(current[key], dict):
-            current[key] = {}
-        current = current[key]
-    current[key_path[-1]] = value
-    return data
-
-
 # ---------------------------------------------------------------------------
 # Patient / admission data utilities
 # ---------------------------------------------------------------------------
-
-
-def combine_patients_and_admissions(
-    patients_df: pd.DataFrame,
-    admissions_df: pd.DataFrame,
-) -> pd.DataFrame:
-    """Merge patient demographics with admission data.
-
-    Args:
-        patients_df: DataFrame with patient records (must have 'person_id').
-        admissions_df: DataFrame with admission records (must have 'patient_id').
-
-    Returns:
-        Merged DataFrame.
-    """
-    return admissions_df.merge(
-        patients_df,
-        left_on="patient_id",
-        right_on="person_id",
-        how="left",
-        suffixes=("_adm", "_pt"),
-    )
 
 
 def clean_patient_details(patient: dict) -> dict:
@@ -647,40 +454,6 @@ def clean_event_details(event: dict) -> dict:
         Cleaned dict safe for string interpolation.
     """
     return clean_patient_details(event)
-
-
-def normalise_array_struct_column(
-    df: pd.DataFrame,
-    column: str,
-    default: Any = None,
-) -> pd.DataFrame:
-    """Normalise a column containing JSON strings or Python objects.
-
-    Attempts to parse string values as JSON; replaces parse failures with
-    the default value.
-
-    Args:
-        df: DataFrame to modify.
-        column: Column name to normalise.
-        default: Value to use when parsing fails.
-
-    Returns:
-        DataFrame with normalised column (modified in-place copy).
-    """
-    df = df.copy()
-
-    def _parse(val: Any) -> Any:
-        if val is None or (isinstance(val, float) and np.isnan(val)):
-            return default
-        if isinstance(val, str):
-            try:
-                return json.loads(val)
-            except (json.JSONDecodeError, ValueError):
-                return default
-        return val
-
-    df[column] = df[column].apply(_parse)
-    return df
 
 
 # ---------------------------------------------------------------------------
@@ -727,6 +500,7 @@ def build_output_info(
     admissions: list[dict],
     journeys: list[list[dict]],
     clinical_notes: list[list[dict]],
+    code_reflection_reports: list[dict] | None = None,
 ) -> dict[str, Any]:
     """Build a summary info dict for a completed generation run.
 
@@ -735,6 +509,13 @@ def build_output_info(
         admissions: List of generated admission dicts.
         journeys: List of lists of journey event dicts.
         clinical_notes: List of lists of clinical note dicts.
+        code_reflection_reports: Optional list of per-patient backward-pass
+            reflection reports (see check_code_reflected /
+            main.step_verify_code_reflection), one dict per patient mapping
+            "<role>:<code>" (role is 'diagnostic' or 'procedure', since the
+            same bare code string can appear in both a diagnostic and a
+            procedure code system) -> {'patient':..., 'admission':...,
+            'journey':..., 'notes':...}.
 
     Returns:
         Summary statistics dict.
@@ -748,7 +529,7 @@ def build_output_info(
             nt = note.get("note_type", "unknown")
             note_types[nt] = note_types.get(nt, 0) + 1
 
-    return {
+    summary: dict[str, Any] = {
         "n_patients": len(patients),
         "n_admissions": len(admissions),
         "n_journey_events": total_events,
@@ -759,99 +540,71 @@ def build_output_info(
         "generation_timestamp": datetime.utcnow().isoformat(),
     }
 
+    if code_reflection_reports:
+        total_codes = 0
+        reflected_codes = 0
+        unreflected_codes: list[str] = []
+        for report in code_reflection_reports:
+            for report_key, result in report.items():
+                total_codes += 1
+                # report_key is "<role>:<code>"; the summary's
+                # unreflected_codes list is a user-facing field that predates
+                # the role tag, so strip it back to the bare code here.
+                code = report_key.split(":", 1)[1] if ":" in report_key else report_key
+                if result["admission"] or result["notes"]:
+                    reflected_codes += 1
+                else:
+                    unreflected_codes.append(code)
+        summary["code_reflection_check"] = {
+            "n_codes_checked": total_codes,
+            "n_codes_reflected": reflected_codes,
+            "unreflected_codes": unreflected_codes,
+        }
 
-# ---------------------------------------------------------------------------
-# read_write_data: CSV-based I/O
-# ---------------------------------------------------------------------------
+    quality_metrics = average_note_quality_metrics(clinical_notes)
+    if quality_metrics:
+        summary["note_quality_metrics"] = quality_metrics
+
+    return summary
 
 
-def read_data(
-    file_path: str,
-    schema: dict[str, Any] | None = None,
-) -> pd.DataFrame:
-    """Read a CSV file into a DataFrame, optionally applying a schema.
+_QUALITY_METRIC_KEYS = (
+    "flesch_reading_ease",
+    "flesch_kincaid_grade",
+    "gunning_fog",
+    "word_count",
+    "fluency_score",
+    "groundedness_score",
+    "relevance_score",
+)
+
+
+def average_note_quality_metrics(clinical_notes: list[list[dict]]) -> dict[str, float]:
+    """Average any quality-evaluation scores (see evaluate_note) present on notes.
+
+    Notes without evaluation scores (evaluation wasn't run, or a metric
+    failed and was left as None) are silently skipped per-metric.
 
     Args:
-        file_path: Absolute or relative path to the CSV file.
-        schema: Optional dtype schema dict (from schemas.py).
+        clinical_notes: List of lists of clinical note dicts.
 
     Returns:
-        DataFrame.
-
-    Raises:
-        FileNotFoundError: If the file does not exist.
+        Dict of avg_<metric> -> mean value, for whichever metrics were
+        present on at least one note. Empty dict if none were evaluated.
     """
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(f"Data file not found: {file_path}")
+    values: dict[str, list[float]] = {key: [] for key in _QUALITY_METRIC_KEYS}
+    for notes in clinical_notes:
+        for note in notes:
+            for key in _QUALITY_METRIC_KEYS:
+                val = note.get(key)
+                if val is not None:
+                    values[key].append(val)
 
-    df = pd.read_csv(file_path, low_memory=False)
-
-    if schema:
-        for col, dtype in schema.items():
-            if col in df.columns:
-                try:
-                    if dtype in ("string",):
-                        df[col] = df[col].astype("string")
-                    elif dtype in ("boolean",):
-                        df[col] = df[col].astype("boolean")
-                    elif dtype in ("Int32", "Int64"):
-                        df[col] = pd.array(df[col], dtype=dtype)
-                    elif dtype in ("datetime64[ns]",):
-                        df[col] = pd.to_datetime(df[col], errors="coerce")
-                    # object columns left as-is
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug(
-                        "Could not cast column %s to %s: %s", col, dtype, exc
-                    )
-    return df
-
-
-def write_data(
-    df: pd.DataFrame,
-    file_path: str,
-    create_dirs: bool = True,
-) -> None:
-    """Write a DataFrame to a CSV file.
-
-    Args:
-        df: DataFrame to write.
-        file_path: Destination file path.
-        create_dirs: If True, create parent directories if they don't exist.
-    """
-    if create_dirs:
-        os.makedirs(os.path.dirname(os.path.abspath(file_path)), exist_ok=True)
-    df.to_csv(file_path, index=False)
-    logger.info("Wrote %d rows to %s", len(df), file_path)
-
-
-def read_write_data(
-    input_path: str | None,
-    output_path: str,
-    processor_fn,
-    schema: dict[str, Any] | None = None,
-) -> pd.DataFrame:
-    """Read data from CSV, apply processor function, write result to CSV.
-
-    This is the main pipeline I/O function. If input_path is None, an empty
-    DataFrame is passed to processor_fn.
-
-    Args:
-        input_path: Path to input CSV (or None for generation-from-scratch).
-        output_path: Path to write output CSV.
-        processor_fn: Callable(df) -> df to apply to the data.
-        schema: Optional dtype schema for input reading.
-
-    Returns:
-        Processed DataFrame.
-    """
-    if input_path and os.path.exists(input_path):
-        df_in = read_data(input_path, schema=schema)
-    else:
-        df_in = pd.DataFrame()
-
-    df_out = processor_fn(df_in)
-    write_data(df_out, output_path)
-    return df_out
+    return {
+        f"avg_{key}": sum(vals) / len(vals)
+        for key, vals in values.items()
+        if vals
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -859,98 +612,115 @@ def read_write_data(
 # ---------------------------------------------------------------------------
 
 
+def _build_code_context(
+    system: Any,
+    code: str,
+    enable_research: bool,
+    model: str | None,
+) -> str:
+    """Build LLM-prompt-ready context for a single code.
+
+    For codes not in the system's curated dictionary, uses web-search-backed
+    research (src/codes/research.py) when enable_research is True, falling
+    back to the generic "code not found" message otherwise or if research
+    fails to produce a confident result.
+    """
+    from src.codes import registry  # noqa: PLC0415
+
+    if enable_research and registry.lookup_code(system, code) is None:
+        from src.codes import research  # noqa: PLC0415
+
+        researched = research.get_researched_clinical_context(system, code, model=model)
+        if researched is not None:
+            return researched
+
+    return registry.get_clinical_context(system, code)
+
+
 def generate_from_codes(
-    icd10_codes: list[str],
-    opcs4_codes: list[str],
+    diagnostic_codes: list[str],
+    procedure_codes: list[str],
     patient_details: dict,
     admission_date: str,
     admission_time: str,
     model: str | None = None,
+    diagnostic_code_system: str = "icd10",
+    procedure_code_system: str = "opcs4",
+    enable_code_research: bool = False,
+    min_los_days: int = 1,
+    max_los_days: int = 14,
 ) -> dict:
-    """Generate an admission record driven by ICD-10 and/or OPCS-4 codes.
+    """Generate an admission record driven by diagnostic and/or procedure codes.
 
-    Selects the most appropriate prompt based on which codes are provided:
-    - ICD-10 only -> icd10_admission_prompt
-    - OPCS-4 only -> opcs4_admission_prompt
-    - Both -> multi_code_admission_prompt
-    - Neither -> emergency_admission_prompt with random diagnosis
+    Works with any registered code system (see src/codes/registry.py), not
+    just ICD-10/OPCS-4 - diagnostic_code_system and procedure_code_system
+    select which registered CodeSystem the codes belong to. Built-in
+    systems are 'icd10' (diagnostic) and 'opcs4' (procedure); additional
+    standards (ICD-11, SNOMED CT, CPT, etc.) can be added by registering a
+    new CodeSystem, with no changes required here.
+
+    If neither diagnostic_codes nor procedure_codes are given, falls back
+    to a generic emergency admission prompt with a random presentation,
+    guided by min_los_days/max_los_days (codes with a curated or researched
+    typical_los_days already carry their own LOS guidance, so those bounds
+    only apply to this uncoded fallback path).
 
     Args:
-        icd10_codes: List of ICD-10 codes (may be empty).
-        opcs4_codes: List of OPCS-4 codes (may be empty).
+        diagnostic_codes: List of diagnostic codes (may be empty).
+        procedure_codes: List of procedure codes (may be empty).
         patient_details: Dict of patient demographics.
         admission_date: ISO date string (YYYY-MM-DD).
         admission_time: HH:MM time string.
         model: Optional model override.
+        diagnostic_code_system: Registry key for the diagnostic code system
+            the codes belong to (default 'icd10').
+        procedure_code_system: Registry key for the procedure code system
+            the codes belong to (default 'opcs4').
+        enable_code_research: If True, codes with no curated dictionary
+            entry are researched via web search before generation (adds
+            latency/cost per unique uncurated code - see src/codes/research.py).
+        min_los_days: Minimum length of stay to suggest for the no-codes
+            fallback path (default 1).
+        max_los_days: Maximum length of stay to suggest for the no-codes
+            fallback path (default 14).
 
     Returns:
-        Dict containing generated admission data. Keys depend on prompt used.
+        Dict containing generated admission data, enriched with
+        diagnostic_codes/procedure_codes and the code system keys used.
     """
-    from src.codes.icd10 import get_clinical_context as icd10_context  # noqa: PLC0415
-    from src.codes.opcs4 import get_clinical_context as opcs4_context  # noqa: PLC0415
+    from src.codes import registry  # noqa: PLC0415
     from src.prompts import patient_prompts  # noqa: PLC0415
 
     patient_str = json.dumps(clean_patient_details(patient_details), indent=2)
 
-    has_icd10 = bool(icd10_codes)
-    has_opcs4 = bool(opcs4_codes)
+    if diagnostic_codes or procedure_codes:
+        diag_system = registry.get_code_system(diagnostic_code_system)
+        proc_system = registry.get_code_system(procedure_code_system)
 
-    if has_icd10 and has_opcs4:
-        # Multi-code path
-        diagnoses_parts = []
-        for code in icd10_codes:
-            diagnoses_parts.append(icd10_context(code))
-        diagnoses_str = "\n".join(diagnoses_parts)
+        diagnoses_str = (
+            "\n".join(
+                _build_code_context(diag_system, c, enable_code_research, model)
+                for c in diagnostic_codes
+            )
+            or "None specified."
+        )
+        procedures_str = (
+            "\n".join(
+                _build_code_context(proc_system, c, enable_code_research, model)
+                for c in procedure_codes
+            )
+            or "None specified."
+        )
 
-        procedures_parts = []
-        for code in opcs4_codes:
-            procedures_parts.append(opcs4_context(code))
-        procedures_str = "\n".join(procedures_parts)
-
-        prompt = patient_prompts["multi_code_admission_prompt"].substitute(
+        prompt = patient_prompts["code_driven_admission_prompt"].substitute(
             PATIENT_DETAILS=patient_str,
+            DIAGNOSTIC_CODE_SYSTEM=diag_system.name,
             DIAGNOSES_CONTEXT=diagnoses_str,
+            PROCEDURE_CODE_SYSTEM=proc_system.name,
             PROCEDURES_CONTEXT=procedures_str,
             ADMISSION_DATE=admission_date,
             ADMISSION_TIME=admission_time,
         )
-
-    elif has_icd10:
-        # ICD-10 only
-        primary_code = icd10_codes[0]
-        from src.codes.icd10 import lookup_code as icd10_lookup  # noqa: PLC0415
-
-        info = icd10_lookup(primary_code) or {}
-        description = info.get("description", f"ICD-10 {primary_code}")
-        context = icd10_context(primary_code)
-
-        prompt = patient_prompts["icd10_admission_prompt"].substitute(
-            PATIENT_DETAILS=patient_str,
-            ICD10_CODE=primary_code,
-            ICD10_DESCRIPTION=description,
-            ICD10_CONTEXT=context,
-            ADMISSION_DATE=admission_date,
-            ADMISSION_TIME=admission_time,
-        )
-
-    elif has_opcs4:
-        # OPCS-4 only
-        primary_code = opcs4_codes[0]
-        from src.codes.opcs4 import lookup_code as opcs4_lookup  # noqa: PLC0415
-
-        info = opcs4_lookup(primary_code) or {}
-        description = info.get("description", f"OPCS-4 {primary_code}")
-        context = opcs4_context(primary_code)
-
-        prompt = patient_prompts["opcs4_admission_prompt"].substitute(
-            PATIENT_DETAILS=patient_str,
-            OPCS4_CODE=primary_code,
-            OPCS4_DESCRIPTION=description,
-            OPCS4_CONTEXT=context,
-            ADMISSION_DATE=admission_date,
-            ADMISSION_TIME=admission_time,
-        )
-
     else:
         # No codes provided: use a generic emergency admission prompt
         prompt = patient_prompts["emergency_admission_prompt"].substitute(
@@ -961,6 +731,8 @@ def generate_from_codes(
             SPECIALTY="General Medicine",
             ADMISSION_DATE=admission_date,
             ADMISSION_TIME=admission_time,
+            MIN_LOS_DAYS=str(min_los_days),
+            MAX_LOS_DAYS=str(max_los_days),
         )
 
     response = call_llm(prompt, model=model, temp=0.8)
@@ -971,16 +743,291 @@ def generate_from_codes(
         logger.warning("Failed to parse admission JSON: %s", exc)
         admission_data = {
             "raw_response": response,
-            "icd10_codes": icd10_codes,
-            "opcs4_codes": opcs4_codes,
             "admission_date": admission_date,
             "parse_error": str(exc),
         }
 
     # Enrich with code metadata
-    admission_data["icd10_codes"] = icd10_codes
-    admission_data["opcs4_codes"] = opcs4_codes
+    admission_data["diagnostic_codes"] = diagnostic_codes
+    admission_data["diagnostic_code_system"] = diagnostic_code_system if diagnostic_codes else None
+    admission_data["procedure_codes"] = procedure_codes
+    admission_data["procedure_code_system"] = procedure_code_system if procedure_codes else None
     return admission_data
+
+
+def get_code_context(
+    code_system: str,
+    code: str,
+    enable_research: bool = False,
+    model: str | None = None,
+) -> str:
+    """Resolve a registered code system by key and build LLM-ready context for a code.
+
+    Public entry point for callers outside this module (e.g. main.py's
+    corrective retry step) that only have a code system key string, not a
+    CodeSystem instance.
+
+    Args:
+        code_system: Registry key of the code system (e.g. 'icd10').
+        code: The code to build context for.
+        enable_research: If True, research uncurated codes via web search.
+        model: Optional model override for the research synthesis call.
+
+    Returns:
+        LLM-prompt-ready context string.
+    """
+    from src.codes import registry  # noqa: PLC0415
+
+    system = registry.get_code_system(code_system)
+    return _build_code_context(system, code, enable_research, model)
+
+
+# ---------------------------------------------------------------------------
+# Targeted backward-pass correction
+# ---------------------------------------------------------------------------
+
+
+def correct_admission_for_code(
+    admission: dict,
+    code: str,
+    code_context: str,
+    model: str | None = None,
+) -> dict:
+    """Revise an admission record so it explicitly reflects a given code.
+
+    Used as a targeted corrective step after check_code_reflected finds a
+    driving code missing from the admission's clinical narrative - re-runs
+    generation for just this admission rather than the whole patient.
+
+    Args:
+        admission: Current admission dict.
+        code: The code that should be reflected.
+        code_context: LLM-ready clinical context for the code (see
+            get_code_context).
+        model: Optional model override.
+
+    Returns:
+        A new admission dict with narrative fields revised. Bookkeeping
+        fields (diagnostic_codes/procedure_codes/*_system) are preserved
+        from the original admission unchanged. On any failure (LLM error,
+        unparseable response), returns the original admission unchanged.
+    """
+    from src.prompts import correction_prompts  # noqa: PLC0415
+
+    narrative = {k: v for k, v in admission.items() if k not in _ADMISSION_CODE_BOOKKEEPING_FIELDS}
+    prompt = correction_prompts["correct_admission_prompt"].substitute(
+        CODE=code,
+        CODE_CONTEXT=code_context,
+        CURRENT_ADMISSION=json.dumps(narrative, indent=2, default=str),
+    )
+
+    try:
+        response = call_llm(prompt, model=model, temp=0.4)
+        revised_narrative = parse_llm_json(response)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Admission correction failed for code %s: %s", code, exc)
+        return admission
+
+    if not isinstance(revised_narrative, dict):
+        logger.warning("Admission correction for code %s returned non-dict JSON, discarding", code)
+        return admission
+
+    corrected = dict(admission)
+    corrected.update(revised_narrative)
+    # Bookkeeping fields are ours to manage, not the LLM's - restore them
+    # in case the model echoed or altered them despite not being asked to.
+    for field in _ADMISSION_CODE_BOOKKEEPING_FIELDS:
+        if field in admission:
+            corrected[field] = admission[field]
+    return corrected
+
+
+def correct_note_for_code(
+    note_text: str,
+    code: str,
+    code_context: str,
+    model: str | None = None,
+) -> str:
+    """Revise a clinical note's text so it explicitly reflects a given code.
+
+    Args:
+        note_text: Current note text.
+        code: The code that should be reflected.
+        code_context: LLM-ready clinical context for the code (see
+            get_code_context).
+        model: Optional model override.
+
+    Returns:
+        Revised note text, or the original text unchanged on any failure
+        (LLM error, empty response).
+    """
+    from src.prompts import correction_prompts  # noqa: PLC0415
+
+    prompt = correction_prompts["correct_note_prompt"].substitute(
+        CODE=code,
+        CODE_CONTEXT=code_context,
+        CURRENT_NOTE=note_text,
+    )
+
+    try:
+        revised = call_llm(prompt, model=model, temp=0.4)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Note correction failed for code %s: %s", code, exc)
+        return note_text
+
+    revised = revised.strip()
+    return revised if revised else note_text
+
+
+# ---------------------------------------------------------------------------
+# Diagnosis reflection check (backward pass)
+# ---------------------------------------------------------------------------
+
+
+# Bookkeeping fields generate_from_codes mechanically attaches to every
+# admission record. Excluded from the "admission" reflection check below,
+# otherwise the check would trivially pass on these alone - the point is to
+# confirm the code made it into the *clinical narrative*, not just that it
+# was echoed back as metadata.
+_ADMISSION_CODE_BOOKKEEPING_FIELDS = frozenset(
+    {
+        "diagnostic_codes",
+        "diagnostic_code_system",
+        "procedure_codes",
+        "procedure_code_system",
+        # main.py attaches the reflection report itself onto the admission
+        # dict for output purposes. It's JSON-serialised code metadata, not
+        # clinical narrative, so it must stay excluded here too - otherwise
+        # a later reflection check against the same admission would
+        # trivially "pass" by matching a code string embedded in a
+        # *previous* check's own report rather than the actual narrative.
+        "code_reflection_check",
+    }
+)
+
+
+def _check_code_reflected(
+    code: str,
+    description: str,
+    patient: dict,
+    admission: dict,
+    journey: list[dict],
+    notes: list[dict],
+) -> dict[str, bool]:
+    """Shared matching logic for check_diagnosis_reflected / check_procedure_reflected."""
+    needles = {code.strip().lower()}
+    needles.update(word.lower() for word in re.findall(r"[A-Za-z]{4,}", description))
+
+    def _contains(part: Any) -> bool:
+        haystack = json.dumps(part, default=str).lower()
+        return any(needle in haystack for needle in needles)
+
+    admission_narrative = {
+        k: v for k, v in admission.items() if k not in _ADMISSION_CODE_BOOKKEEPING_FIELDS
+    }
+
+    return {
+        "patient": _contains(patient),
+        "admission": _contains(admission_narrative),
+        "journey": _contains(journey),
+        "notes": _contains(notes),
+    }
+
+
+def check_code_reflected(
+    code: str,
+    code_system: str,
+    patient: dict,
+    admission: dict,
+    journey: list[dict],
+    notes: list[dict],
+) -> dict[str, bool]:
+    """Backward-pass check for a code from any registered system.
+
+    The forward pass looks up a code (see generate_from_codes) and pushes
+    its description into the generation prompts. This is the matching
+    backward pass: given the generated patient, admission, journey, and
+    notes, confirm the code actually made it into each part's text content.
+    Works for any code system registered in src/codes/registry.py, not just
+    ICD-10/OPCS-4.
+
+    Args:
+        code: Code to search for (e.g. 'I21.0').
+        code_system: Registry key of the code system the code belongs to
+            (e.g. 'icd10', 'opcs4').
+        patient: Generated patient dict.
+        admission: Generated admission dict.
+        journey: Generated list of journey event dicts.
+        notes: Generated list of clinical note dicts.
+
+    Returns:
+        Dict with keys 'patient', 'admission', 'journey', 'notes', each True
+        if the code or a keyword from its description appears in that part.
+    """
+    from src.codes import registry  # noqa: PLC0415
+
+    system = registry.get_code_system(code_system)
+    info = registry.lookup_code(system, code)
+    description = info["description"] if info else ""
+    return _check_code_reflected(code, description, patient, admission, journey, notes)
+
+
+def check_diagnosis_reflected(
+    icd10_code: str,
+    patient: dict,
+    admission: dict,
+    journey: list[dict],
+    notes: list[dict],
+    code_system: str = "icd10",
+) -> dict[str, bool]:
+    """Backward-pass check for a diagnosis across generated output.
+
+    Convenience wrapper around check_code_reflected, defaulting to ICD-10.
+    Pass code_system to check a diagnosis from a different registered
+    diagnostic standard (e.g. 'icd11', 'snomed-ct').
+
+    Args:
+        icd10_code: Diagnostic code to search for (e.g. 'I21.0').
+        patient: Generated patient dict.
+        admission: Generated admission dict.
+        journey: Generated list of journey event dicts.
+        notes: Generated list of clinical note dicts.
+        code_system: Registry key of the diagnostic code system (default 'icd10').
+
+    Returns:
+        Dict with keys 'patient', 'admission', 'journey', 'notes', each True
+        if the code or a keyword from its description appears in that part.
+    """
+    return check_code_reflected(icd10_code, code_system, patient, admission, journey, notes)
+
+
+def check_procedure_reflected(
+    opcs4_code: str,
+    patient: dict,
+    admission: dict,
+    journey: list[dict],
+    notes: list[dict],
+    code_system: str = "opcs4",
+) -> dict[str, bool]:
+    """Backward-pass check for a procedure across generated output.
+
+    Convenience wrapper around check_code_reflected, defaulting to OPCS-4.
+    Pass code_system to check a procedure from a different registered
+    procedure standard (e.g. 'cpt', 'hcpcs').
+
+    Args:
+        opcs4_code: Procedure code to search for (e.g. 'K40.1').
+        patient: Generated patient dict.
+        admission: Generated admission dict.
+        journey: Generated list of journey event dicts.
+        notes: Generated list of clinical note dicts.
+        code_system: Registry key of the procedure code system (default 'opcs4').
+
+    Returns:
+        Dict with keys 'patient', 'admission', 'journey', 'notes', each True
+        if the code or a keyword from its description appears in that part.
+    """
+    return check_code_reflected(opcs4_code, code_system, patient, admission, journey, notes)
 
 
 # ---------------------------------------------------------------------------
@@ -1034,6 +1081,7 @@ def generate_journey(
     discharge_date: str,
     possible_event_types: list[str],
     model: str | None = None,
+    target_event_count: int = 8,
 ) -> list[dict]:
     """Generate a sequence of clinical events for a patient journey.
 
@@ -1044,6 +1092,10 @@ def generate_journey(
         discharge_date: ISO date string.
         possible_event_types: List of valid event type names.
         model: Optional model override.
+        target_event_count: Approximate number of events to aim for - a
+            soft guide passed into the prompt, not a hard cap. The LLM is
+            explicitly told actual clinical realism (LOS, admission type)
+            takes priority over hitting this exactly.
 
     Returns:
         List of event dicts ordered chronologically.
@@ -1060,6 +1112,7 @@ def generate_journey(
         ADMISSION_DATE=admission_date,
         DISCHARGE_DATE=discharge_date,
         POSSIBLE_EVENT_TYPES=event_types_str,
+        TARGET_EVENT_COUNT=str(target_event_count),
     )
 
     response = call_llm(prompt, model=model, temp=0.8)
@@ -1118,6 +1171,7 @@ def generate_clinical_note(
     from src.prompts import note_prompts  # noqa: PLC0415
 
     patient_str = json.dumps(clean_patient_details(patient), indent=2)
+    admission_str = json.dumps(clean_event_details(admission), indent=2)
     event_str = json.dumps(clean_event_details(event), indent=2)
     prev_str = json.dumps(
         [clean_event_details(e) for e in previous_events[-5:]], indent=2
@@ -1125,6 +1179,7 @@ def generate_clinical_note(
 
     prompt = note_prompts["clinical_note_prompt"].substitute(
         PATIENT_DETAILS=patient_str,
+        ADMISSION_DETAILS=admission_str,
         EVENT_DETAILS=event_str,
         PREVIOUS_EVENTS=prev_str,
         NOTE_TEMPLATE=note_template_str,
@@ -1134,3 +1189,146 @@ def generate_clinical_note(
     )
 
     return call_llm(prompt, model=model, temp=0.85)
+
+
+# ---------------------------------------------------------------------------
+# Quality evaluation metrics
+# ---------------------------------------------------------------------------
+
+
+def calculate_readability_metrics(note_text: str) -> dict[str, Any]:
+    """Compute objective readability metrics for a note (no LLM call).
+
+    Args:
+        note_text: Clinical note text.
+
+    Returns:
+        Dict with flesch_reading_ease, flesch_kincaid_grade, gunning_fog,
+        and word_count, or an empty dict if note_text is blank.
+    """
+    if not note_text or not note_text.strip():
+        return {}
+
+    import textstat  # noqa: PLC0415
+
+    return {
+        "flesch_reading_ease": textstat.flesch_reading_ease(note_text),
+        "flesch_kincaid_grade": textstat.flesch_kincaid_grade(note_text),
+        "gunning_fog": textstat.gunning_fog(note_text),
+        "word_count": textstat.lexicon_count(note_text),
+    }
+
+
+def calculate_fluency(note_text: str, model: str | None = None) -> dict[str, Any]:
+    """LLM-judged linguistic fluency of a note (grammar, register, coherence).
+
+    Args:
+        note_text: Clinical note text.
+        model: Optional model override.
+
+    Returns:
+        Parsed JSON dict per evaluation_prompts['calculate_fluency_prompt']
+        (fluency_score, grammar_score, clinical_register_score, etc.).
+    """
+    from src.prompts import evaluation_prompts  # noqa: PLC0415
+
+    prompt = evaluation_prompts["calculate_fluency_prompt"].substitute(NOTE=note_text)
+    response = call_llm(prompt, model=model, temp=0.2)
+    return parse_llm_json(response)
+
+
+def calculate_groundedness(note_text: str, reference_material: str, model: str | None = None) -> dict[str, Any]:
+    """LLM-judged groundedness of a note against its reference context.
+
+    Args:
+        note_text: Clinical note text.
+        reference_material: Reference context (e.g. admission/patient JSON)
+            the note should be factually consistent with.
+        model: Optional model override.
+
+    Returns:
+        Parsed JSON dict per evaluation_prompts['calculate_groundedness_prompt']
+        (groundedness_score, is_grounded, hallucinations, etc.).
+    """
+    from src.prompts import evaluation_prompts  # noqa: PLC0415
+
+    prompt = evaluation_prompts["calculate_groundedness_prompt"].substitute(
+        NOTE=note_text, REFERENCE=reference_material
+    )
+    response = call_llm(prompt, model=model, temp=0.2)
+    return parse_llm_json(response)
+
+
+def calculate_relevance(note_text: str, reference_material: str, model: str | None = None) -> dict[str, Any]:
+    """LLM-judged clinical relevance of a note to its stated context.
+
+    Args:
+        note_text: Clinical note text.
+        reference_material: Reference context (e.g. admission/patient JSON)
+            the note's content should be relevant to.
+        model: Optional model override.
+
+    Returns:
+        Parsed JSON dict per evaluation_prompts['calculate_relevance_prompt']
+        (relevance_score, is_relevant, missing_elements, etc.).
+    """
+    from src.prompts import evaluation_prompts  # noqa: PLC0415
+
+    prompt = evaluation_prompts["calculate_relevance_prompt"].substitute(
+        NOTE=note_text, REFERENCE=reference_material
+    )
+    response = call_llm(prompt, model=model, temp=0.2)
+    return parse_llm_json(response)
+
+
+def evaluate_note(
+    note_text: str,
+    reference_material: str,
+    model: str | None = None,
+) -> dict[str, Any]:
+    """Evaluate a generated note: objective readability plus LLM-judged
+    fluency/groundedness/relevance.
+
+    Combines calculate_readability_metrics (free, always computed) with
+    calculate_fluency/calculate_groundedness/calculate_relevance (3 LLM
+    calls - meant to be gated behind an opt-in flag by callers, since this
+    triples the LLM cost per note evaluated). Returns a flat dict so the
+    scores can be merged directly onto a note record and flow straight
+    into CSV output as extra columns. Any individual metric that fails to
+    compute is set to None rather than aborting the whole evaluation.
+
+    Args:
+        note_text: Clinical note text to evaluate.
+        reference_material: Reference context (e.g. admission/patient JSON)
+            to check groundedness/relevance against.
+        model: Optional model override.
+
+    Returns:
+        Flat dict: readability keys plus fluency_score, groundedness_score,
+        relevance_score.
+    """
+    metrics: dict[str, Any] = calculate_readability_metrics(note_text)
+
+    try:
+        metrics["fluency_score"] = calculate_fluency(note_text, model=model).get("fluency_score")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Fluency evaluation failed: %s", exc)
+        metrics["fluency_score"] = None
+
+    try:
+        metrics["groundedness_score"] = calculate_groundedness(
+            note_text, reference_material, model=model
+        ).get("groundedness_score")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Groundedness evaluation failed: %s", exc)
+        metrics["groundedness_score"] = None
+
+    try:
+        metrics["relevance_score"] = calculate_relevance(
+            note_text, reference_material, model=model
+        ).get("relevance_score")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Relevance evaluation failed: %s", exc)
+        metrics["relevance_score"] = None
+
+    return metrics

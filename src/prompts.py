@@ -8,6 +8,8 @@ Categories:
   - note_prompts: clinical note generation
   - processing_prompts: post-processing (cleaning, abbreviations)
   - evaluation_prompts: quality evaluation metrics
+  - research_prompts: web-search-grounded code research (src/codes/research.py)
+  - correction_prompts: targeted backward-pass correction (main.py)
 
 Adapted from nhsengland/synthetic_clinical_notes with additions for
 ICD-10 and OPCS-4 code-driven generation.
@@ -83,151 +85,39 @@ patient_prompts: dict[str, Template] = {
         "- admitting_consultant: $CONSULTANT\n"
         "- specialty: $SPECIALTY\n"
         "- ward: appropriate ward for specialty\n"
-        "- estimated_los_days: estimated length of stay as integer\n\n"
+        "- estimated_los_days: estimated length of stay as integer, realistically between "
+        "$MIN_LOS_DAYS and $MAX_LOS_DAYS days for this presentation\n\n"
         "Use realistic UK clinical terminology and NHS documentation conventions. "
         "Measurements in SI units (mmHg, mmol/L, g/dL). "
         "Return ONLY valid JSON."
     ),
 
-    "elective_admission_prompt": Template(
-        "You are an NHS clinician generating a realistic synthetic elective admission "
-        "summary for clinical note training data.\n\n"
-        "PATIENT DETAILS:\n$PATIENT_DETAILS\n\n"
-        "PLANNED PROCEDURE: $PROCEDURE\n"
-        "ADMITTING CONSULTANT: $CONSULTANT\n"
-        "SPECIALTY: $SPECIALTY\n"
-        "ADMISSION DATE: $ADMISSION_DATE\n"
-        "ADMISSION TIME: $ADMISSION_TIME\n\n"
-        "Generate a realistic elective admission clerking note as a JSON object with "
-        "these keys:\n"
-        "- admission_type: 'elective'\n"
-        "- admission_method: 'Elective admission'\n"
-        "- planned_procedure: full procedure name\n"
-        "- indication: clinical indication for the procedure\n"
-        "- past_medical_history: relevant PMH and surgical history\n"
-        "- medications: current medications including peri-operative adjustments\n"
-        "- allergies: known drug allergies\n"
-        "- examination_findings: pre-operative examination including vitals\n"
-        "- pre_op_investigations: pre-operative investigations reviewed\n"
-        "- asa_grade: ASA classification (I-IV) with brief justification\n"
-        "- consent_status: obtained/pending\n"
-        "- management_plan: admission and peri-operative plan\n"
-        "- admitting_consultant: $CONSULTANT\n"
-        "- specialty: $SPECIALTY\n"
-        "- ward: appropriate ward for specialty\n"
-        "- estimated_los_days: estimated length of stay as integer\n\n"
-        "Use realistic UK clinical terminology and NHS documentation conventions. "
-        "Return ONLY valid JSON."
-    ),
-
-    "length_of_stay_prompt": Template(
-        "You are an NHS clinical informatics specialist. Based on the following admission "
-        "details, estimate a realistic length of stay in days for this patient.\n\n"
-        "ADMISSION DETAILS:\n$ADMISSION_DETAILS\n\n"
-        "Consider: diagnosis severity, co-morbidities, age, social circumstances, "
-        "and typical NHS LOS benchmarks for this condition.\n\n"
-        "Return ONLY a JSON object with:\n"
-        "- estimated_los_days: integer (estimated length of stay)\n"
-        "- los_rationale: brief explanation (1-2 sentences)\n"
-        "- discharge_barriers: list of potential factors that could prolong LOS\n\n"
-        "Return ONLY valid JSON."
-    ),
-
-    "icd10_admission_prompt": Template(
+    "code_driven_admission_prompt": Template(
         "You are an experienced NHS consultant generating a realistic synthetic patient "
-        "admission summary driven by a specific ICD-10 diagnosis code. This will be used "
-        "as training data for clinical note generation models.\n\n"
+        "admission summary driven by structured clinical codes. Codes may come from any "
+        "diagnostic or procedure coding standard (e.g. ICD-10, ICD-11, SNOMED CT, OPCS-4, "
+        "CPT) - treat the system name given below as authoritative for how to interpret "
+        "the codes. This will be used as training data for clinical note generation models.\n\n"
         "PATIENT DETAILS:\n$PATIENT_DETAILS\n\n"
-        "ICD-10 CODE: $ICD10_CODE\n"
-        "DIAGNOSIS: $ICD10_DESCRIPTION\n"
-        "CLINICAL CONTEXT:\n$ICD10_CONTEXT\n\n"
-        "ADMISSION DATE: $ADMISSION_DATE\n"
-        "ADMISSION TIME: $ADMISSION_TIME\n\n"
-        "Generate a clinically accurate and realistic NHS admission record grounded in "
-        "the specific ICD-10 diagnosis above. The admission must:\n"
-        "1. Have a chief complaint and history entirely consistent with the ICD-10 diagnosis\n"
-        "2. Include appropriate investigations for this condition (bloods, imaging, ECG, etc.)\n"
-        "3. List medications typical for this diagnosis\n"
-        "4. Reference appropriate NHS clinical guidelines and pathways\n"
-        "5. Include a management plan consistent with current UK clinical practice\n\n"
-        "Return a JSON object with these keys:\n"
-        "- admission_type: 'emergency' or 'elective'\n"
-        "- admission_method: method of admission\n"
-        "- icd10_code: '$ICD10_CODE'\n"
-        "- chief_complaint: presenting complaint specific to this diagnosis\n"
-        "- history_of_presenting_complaint: detailed clinical history\n"
-        "- past_medical_history: relevant comorbidities and PMH\n"
-        "- medications: current medications relevant to diagnosis\n"
-        "- allergies: drug allergies\n"
-        "- examination_findings: full examination with vitals appropriate to this presentation\n"
-        "- investigations: relevant investigations with realistic results for this diagnosis\n"
-        "- working_diagnosis: confirmed ICD-10 diagnosis and differentials\n"
-        "- management_plan: specific management for this ICD-10 diagnosis\n"
-        "- specialty: $ICD10_CODE relevant specialty\n"
-        "- ward: appropriate ward\n"
-        "- estimated_los_days: realistic LOS integer for this diagnosis\n\n"
-        "Return ONLY valid JSON."
-    ),
-
-    "opcs4_admission_prompt": Template(
-        "You are an experienced NHS surgical consultant generating a realistic synthetic "
-        "patient admission summary for a planned procedure defined by an OPCS-4 code. "
-        "This will be used as training data for clinical note generation models.\n\n"
-        "PATIENT DETAILS:\n$PATIENT_DETAILS\n\n"
-        "OPCS-4 CODE: $OPCS4_CODE\n"
-        "PROCEDURE: $OPCS4_DESCRIPTION\n"
-        "SURGICAL CONTEXT:\n$OPCS4_CONTEXT\n\n"
-        "ADMISSION DATE: $ADMISSION_DATE\n"
-        "ADMISSION TIME: $ADMISSION_TIME\n\n"
-        "Generate a clinically accurate NHS surgical admission record for the OPCS-4 "
-        "procedure above. The record must:\n"
-        "1. Include a clear clinical indication for this specific procedure\n"
-        "2. Document appropriate pre-operative assessment and preparation\n"
-        "3. Include realistic surgical consent discussions with procedure-specific risks\n"
-        "4. Reference WHO Surgical Safety Checklist compliance\n"
-        "5. Include a post-operative care plan appropriate for this procedure\n\n"
-        "Return a JSON object with these keys:\n"
-        "- admission_type: 'elective' or 'emergency'\n"
-        "- admission_method: method of admission\n"
-        "- opcs4_code: '$OPCS4_CODE'\n"
-        "- planned_procedure: full procedure name from OPCS-4 code\n"
-        "- indication: clinical indication for this procedure\n"
-        "- past_medical_and_surgical_history: relevant PMH\n"
-        "- medications: current medications with peri-operative adjustments\n"
-        "- allergies: drug allergies\n"
-        "- pre_op_examination: pre-operative examination and airway assessment\n"
-        "- pre_op_investigations: investigations with realistic results\n"
-        "- asa_grade: ASA grade with justification\n"
-        "- consent: procedure-specific consent details\n"
-        "- anaesthetic_plan: planned anaesthetic technique\n"
-        "- management_plan: complete peri-operative plan\n"
-        "- specialty: surgical specialty\n"
-        "- ward: appropriate ward/theatre\n"
-        "- estimated_los_days: realistic LOS integer\n\n"
-        "Return ONLY valid JSON."
-    ),
-
-    "multi_code_admission_prompt": Template(
-        "You are an experienced NHS consultant generating a realistic synthetic patient "
-        "admission summary where multiple ICD-10 diagnoses and/or OPCS-4 procedures "
-        "are present. This will be used as training data for clinical note generation.\n\n"
-        "PATIENT DETAILS:\n$PATIENT_DETAILS\n\n"
-        "DIAGNOSES (ICD-10):\n$DIAGNOSES_CONTEXT\n\n"
-        "PROCEDURES (OPCS-4):\n$PROCEDURES_CONTEXT\n\n"
+        "DIAGNOSES ($DIAGNOSTIC_CODE_SYSTEM):\n$DIAGNOSES_CONTEXT\n\n"
+        "PROCEDURES ($PROCEDURE_CODE_SYSTEM):\n$PROCEDURES_CONTEXT\n\n"
         "ADMISSION DATE: $ADMISSION_DATE\n"
         "ADMISSION TIME: $ADMISSION_TIME\n\n"
         "Generate a clinically coherent NHS admission record that incorporates all of "
-        "the above diagnoses and procedures. Ensure:\n"
+        "the above diagnoses and procedures (ignore any section marked 'None specified'). "
+        "Ensure:\n"
         "1. A logical clinical narrative that links the diagnoses and procedures\n"
         "2. Appropriate priority ordering (primary diagnosis/procedure first)\n"
-        "3. Management plan that addresses each diagnosis and planned procedure\n"
-        "4. Realistic multidisciplinary team involvement\n"
-        "5. NHS documentation standards throughout\n\n"
+        "3. Chief complaint, history, investigations, and medications entirely consistent "
+        "with the diagnoses and procedures above\n"
+        "4. Management plan that addresses each diagnosis and planned procedure\n"
+        "5. Realistic multidisciplinary team involvement\n"
+        "6. NHS documentation standards throughout\n\n"
         "Return a JSON object with keys:\n"
         "- admission_type: 'emergency' or 'elective'\n"
-        "- primary_diagnosis: most clinically significant diagnosis\n"
+        "- primary_diagnosis: most clinically significant diagnosis (empty string if none given)\n"
         "- secondary_diagnoses: list of other diagnoses\n"
-        "- primary_procedure: primary planned procedure if applicable\n"
+        "- primary_procedure: primary planned procedure if applicable (empty string if none given)\n"
         "- secondary_procedures: list of additional procedures if applicable\n"
         "- chief_complaint: presenting complaint\n"
         "- history_of_presenting_complaint: detailed history\n"
@@ -236,6 +126,7 @@ patient_prompts: dict[str, Template] = {
         "- allergies: drug allergies\n"
         "- examination_findings: full clinical examination\n"
         "- investigations: relevant investigations with results\n"
+        "- working_diagnosis: confirmed diagnosis/diagnoses and differentials\n"
         "- management_plan: comprehensive management plan\n"
         "- specialty: primary specialty\n"
         "- ward: appropriate ward\n"
@@ -259,6 +150,7 @@ journey_prompts: dict[str, Template] = {
         "ADMISSION DATE: $ADMISSION_DATE\n"
         "DISCHARGE DATE: $DISCHARGE_DATE\n\n"
         "POSSIBLE EVENT TYPES:\n$POSSIBLE_EVENT_TYPES\n\n"
+        "TARGET NUMBER OF EVENTS: approximately $TARGET_EVENT_COUNT\n\n"
         "Generate a realistic, chronologically ordered sequence of clinical events for "
         "this patient's hospital stay. Each event should be appropriate to the patient's "
         "diagnosis, admission type, and clinical trajectory.\n\n"
@@ -271,7 +163,12 @@ journey_prompts: dict[str, Template] = {
         "- Include therapy reviews if LOS > 3 days\n"
         "- Include inter-specialty reviews if relevant to diagnosis\n"
         "- Events should show a logical clinical trajectory (admission -> treatment -> "
-        "improvement -> discharge)\n\n"
+        "improvement -> discharge)\n"
+        "- Use the target number of events above as a guide, not a hard rule: a short "
+        "admission-date-to-discharge-date window or a simple presentation may reasonably "
+        "need fewer events, and a long or complex admission may need more. Clinical realism "
+        "given the actual LOS and admission type takes priority over hitting the target "
+        "exactly.\n\n"
         "Return a JSON array of event objects. Each event object must have:\n"
         "- event_type: one of the possible event types listed above\n"
         "- event_date: ISO date (YYYY-MM-DD) within admission-discharge range\n"
@@ -282,69 +179,6 @@ journey_prompts: dict[str, Template] = {
         "Return ONLY a valid JSON array."
     ),
 
-    "continue_journey_prompt": Template(
-        "You are continuing to generate a realistic NHS patient journey. "
-        "The journey so far is shown below, along with the remaining events that "
-        "need detailed descriptions.\n\n"
-        "JOURNEY SO FAR:\n$JOURNEY_SO_FAR\n\n"
-        "REMAINING EVENTS TO DETAIL:\n$REMAINING_EVENTS\n\n"
-        "For each remaining event, provide a more detailed brief_description and "
-        "any additional context that will help generate the clinical note. "
-        "Ensure clinical consistency and logical progression from the previous events.\n\n"
-        "Return ONLY a valid JSON array of the remaining events with the same structure "
-        "as the journey so far, with updated brief_description fields."
-    ),
-
-    "generate_event_details_prompt": Template(
-        "You are an NHS clinician generating detailed event information for a specific "
-        "point in a patient's hospital journey. This will be used to generate a "
-        "realistic clinical note.\n\n"
-        "PATIENT DETAILS:\n$PATIENT_DETAILS\n\n"
-        "ADMISSION DETAILS:\n$ADMISSION_DETAILS\n\n"
-        "CURRENT EVENT TYPE: $EVENT_TYPE\n"
-        "EVENT DATE: $EVENT_DATE\n\n"
-        "JOURNEY SO FAR (for clinical context):\n$JOURNEY_SO_FAR\n\n"
-        "AVAILABLE DOCTOR ROLES:\n$DOCTOR_ROLES\n\n"
-        "AVAILABLE THERAPIST ROLES:\n$THERAPIST_ROLES\n\n"
-        "STAFF NAMES TO USE:\n$STAFF_NAMES\n\n"
-        "Generate detailed event information as a JSON object with:\n"
-        "- event_type: '$EVENT_TYPE'\n"
-        "- event_date: '$EVENT_DATE'\n"
-        "- event_time: HH:MM (24-hour format, realistic for this event type)\n"
-        "- clinician_name: choose from staff names provided\n"
-        "- clinician_role: appropriate role from doctor/therapist roles\n"
-        "- clinical_status: patient's clinical status at this point (stable/improving/"
-        "deteriorating/critical)\n"
-        "- key_findings: list of 3-5 key clinical findings relevant to this event\n"
-        "- key_actions: list of 3-5 key actions taken or planned\n"
-        "- vital_signs: dict of current vital signs (HR, BP, RR, SpO2, Temp)\n"
-        "- news2_score: integer NEWS2 score\n"
-        "- brief_clinical_summary: 2-3 sentence summary of this event\n\n"
-        "Ensure clinical coherence with the journey so far. "
-        "Return ONLY valid JSON."
-    ),
-
-    "validate_simple_journey_prompt": Template(
-        "You are an NHS clinical quality reviewer. Review the following synthetic patient "
-        "journey for clinical accuracy, consistency, and realism.\n\n"
-        "PATIENT JOURNEY:\n$JOURNEY\n\n"
-        "ADMISSION DETAILS:\n$ADMISSION_DETAILS\n\n"
-        "PATIENT DETAILS:\n$PATIENT_DETAILS\n\n"
-        "Assess the journey for:\n"
-        "1. Clinical accuracy: Are events appropriate for the diagnosis?\n"
-        "2. Chronological consistency: Do events follow a logical timeline?\n"
-        "3. Clinical trajectory: Is the patient pathway realistic (admission to discharge)?\n"
-        "4. NHS appropriateness: Are NHS processes followed correctly?\n"
-        "5. Completeness: Are there missing events that should be present?\n\n"
-        "Return a JSON object with:\n"
-        "- is_valid: boolean\n"
-        "- overall_quality: integer 1-10\n"
-        "- issues_found: list of specific issues (empty list if none)\n"
-        "- suggested_corrections: list of corrections to apply (empty list if none)\n"
-        "- clinical_accuracy_score: integer 1-10\n"
-        "- nhs_appropriateness_score: integer 1-10\n\n"
-        "Return ONLY valid JSON."
-    ),
 }
 
 # ---------------------------------------------------------------------------
@@ -359,6 +193,8 @@ note_prompts: dict[str, Template] = {
         "synthetic training data. The note must be clinically accurate, use appropriate "
         "UK medical terminology, and follow NHS documentation standards.\n\n"
         "PATIENT DETAILS:\n$PATIENT_DETAILS\n\n"
+        "ADMISSION DETAILS (diagnosis/procedure driving this admission):\n"
+        "$ADMISSION_DETAILS\n\n"
         "EVENT DETAILS:\n$EVENT_DETAILS\n\n"
         "PREVIOUS EVENTS IN JOURNEY (for context):\n$PREVIOUS_EVENTS\n\n"
         "NOTE TEMPLATE (sections to include):\n$NOTE_TEMPLATE\n\n"
@@ -374,74 +210,13 @@ note_prompts: dict[str, Template] = {
         "6. Include realistic vital signs appropriate to the clinical state\n"
         "7. Use standard UK drug names (not brand names unless specifically required)\n"
         "8. Apply style instructions for clinical authenticity\n"
-        "9. If red flags apply, ensure they are addressed in the note\n\n"
+        "9. If red flags apply, ensure they are addressed in the note\n"
+        "10. Ensure clinical content is consistent with the admission diagnosis/procedure above\n\n"
         "Format: structured clinical note with clear section headers matching the template. "
         "Do NOT include any patient identifiers beyond those already in patient details. "
         "Write the note text only - no JSON wrapper."
     ),
 
-    "simple_clinical_note_prompt": Template(
-        "You are an NHS clinician. Write a concise, realistic clinical note for "
-        "the following patient event.\n\n"
-        "PATIENT: $PATIENT_DETAILS\n\n"
-        "EVENT: $EVENT_DETAILS\n\n"
-        "Write a realistic clinical note of 150-400 words. "
-        "Include: date/time, clinician role, chief complaint or reason for note, "
-        "key findings, and management plan. "
-        "Use UK clinical conventions and terminology. "
-        "Write the note text only."
-    ),
-
-    "validate_responses_prompt": Template(
-        "You are an NHS clinical quality assurance reviewer evaluating a synthetic "
-        "clinical note for accuracy and quality.\n\n"
-        "CLINICAL NOTE TO EVALUATE:\n$NOTE\n\n"
-        "REFERENCE MATERIAL (admission details, events, patient context):\n$REFERENCE_MATERIAL\n\n"
-        "Evaluate the note against these criteria:\n"
-        "1. Clinical accuracy: Are findings, diagnoses, and treatments clinically appropriate?\n"
-        "2. Factual consistency: Is the note consistent with the reference material?\n"
-        "3. Completeness: Does the note cover the required clinical content?\n"
-        "4. Professional language: Is the language appropriate for NHS clinical documentation?\n"
-        "5. NHS standards: Does it follow UK clinical documentation conventions?\n\n"
-        "Return a JSON object with:\n"
-        "- is_acceptable: boolean (true if note is clinically usable)\n"
-        "- quality_score: integer 1-10\n"
-        "- clinical_accuracy: integer 1-10\n"
-        "- consistency_with_context: integer 1-10\n"
-        "- issues: list of specific issues found (empty if none)\n"
-        "- suggested_improvements: list of improvements (empty if none)\n\n"
-        "Return ONLY valid JSON."
-    ),
-
-    "determine_examination_prompt": Template(
-        "You are an NHS consultant. Based on the event type and patient details below, "
-        "determine whether a full, focused, or no clinical examination should be documented "
-        "in this clinical note.\n\n"
-        "EVENT TYPE: $EVENT_TYPE\n\n"
-        "PATIENT DETAILS:\n$PATIENT_DETAILS\n\n"
-        "Return a JSON object with:\n"
-        "- include_examination: boolean\n"
-        "- examination_type: 'full_systems' / 'focused' / 'targeted' / 'none'\n"
-        "- systems_to_examine: list of body systems to include (empty if none)\n"
-        "- rationale: brief explanation\n\n"
-        "Return ONLY valid JSON."
-    ),
-
-    "red_flags_prompt": Template(
-        "You are an NHS consultant. Based on this patient's admission details, "
-        "identify any clinical red flags or safety-critical considerations that "
-        "should be documented in their clinical notes.\n\n"
-        "ADMISSION DETAILS:\n$ADMISSION_DETAILS\n\n"
-        "PATIENT DETAILS:\n$PATIENT_DETAILS\n\n"
-        "Return a JSON object with:\n"
-        "- has_red_flags: boolean\n"
-        "- red_flags: list of specific red flag conditions or risks (e.g. "
-        "'High-risk airway', 'Anticoagulated patient', 'Recent MI - STEMI protocol', "
-        "'Neutropenic sepsis', 'Safeguarding concern', 'Capacity concerns')\n"
-        "- safety_alerts: list of safety alerts to include in notes\n"
-        "- escalation_criteria: list of clinical criteria requiring urgent escalation\n\n"
-        "Return ONLY valid JSON."
-    ),
 }
 
 # ---------------------------------------------------------------------------
@@ -450,26 +225,6 @@ note_prompts: dict[str, Template] = {
 # ---------------------------------------------------------------------------
 
 processing_prompts: dict[str, Template] = {
-
-    "clean_outputs_prompt": Template(
-        "You are a clinical text processing specialist. Clean the following clinical "
-        "text according to the specified cleaning type.\n\n"
-        "CLEANING TYPE: $CLEANING_TYPE\n\n"
-        "TEXT TO CLEAN:\n$VALUE\n\n"
-        "Cleaning instructions by type:\n"
-        "- 'remove_identifiers': Remove or replace any potential real patient identifiers "
-        "(real NHS numbers, real phone numbers, real addresses) with fictional equivalents. "
-        "Keep the clinical content intact.\n"
-        "- 'standardise_units': Convert all units to SI units used in UK clinical practice "
-        "(mmHg, mmol/L, g/dL, kg, cm, Celsius).\n"
-        "- 'fix_formatting': Fix formatting issues: consistent section headers, "
-        "proper punctuation, remove duplicate whitespace.\n"
-        "- 'clinical_language': Ensure clinical language is appropriate for NHS documentation. "
-        "Replace lay terms with clinical terms where appropriate.\n"
-        "- 'remove_hallucinations': Remove factually incorrect clinical statements, "
-        "fictional drug names, or impossible clinical values.\n\n"
-        "Return the cleaned text only. No explanatory comments."
-    ),
 
     "add_abbreviations_prompt": Template(
         "You are a clinical text specialist. Rewrite the following clinical note to "
@@ -575,5 +330,70 @@ evaluation_prompts: dict[str, Template] = {
         "- irrelevant_content: list of inappropriate content found\n"
         "- diagnosis_specificity_score: float 0.0-1.0\n\n"
         "Return ONLY valid JSON."
+    ),
+}
+
+# ---------------------------------------------------------------------------
+# research_prompts
+# Web-search-grounded research for codes with no curated dictionary entry
+# ---------------------------------------------------------------------------
+
+research_prompts: dict[str, Template] = {
+
+    "research_code_prompt": Template(
+        "You are a clinical coding specialist. Based on the web search results below, "
+        "produce a concise, clinically accurate summary of the following code so it can "
+        "be used to generate realistic NHS clinical documentation.\n\n"
+        "CODE: $CODE\n"
+        "CODE SYSTEM: $CODE_SYSTEM ($CODE_KIND code)\n\n"
+        "WEB SEARCH RESULTS:\n$SEARCH_RESULTS\n\n"
+        "Using ONLY information grounded in the search results above (do not invent "
+        "clinical facts not supported by them), return a JSON object with:\n"
+        "- description: concise clinical name/description of this code (one line)\n"
+        "- specialty: the most relevant NHS clinical/surgical specialty\n"
+        "- type: 'emergency' or 'elective' - typical acuity for this diagnosis/procedure\n"
+        "- typical_los_days_min: integer, typical minimum NHS length of stay in days\n"
+        "- typical_los_days_max: integer, typical maximum NHS length of stay in days\n"
+        "- confidence: 'high' or 'low' - use 'low' if the search results were too sparse, "
+        "off-topic, or ambiguous to confidently determine the above\n\n"
+        "Return ONLY valid JSON."
+    ),
+}
+
+# ---------------------------------------------------------------------------
+# correction_prompts
+# Targeted backward-pass correction when a driving code isn't reflected in
+# already-generated content
+# ---------------------------------------------------------------------------
+
+correction_prompts: dict[str, Template] = {
+
+    "correct_admission_prompt": Template(
+        "You are an NHS clinician revising a synthetic admission record. The record "
+        "below was meant to be grounded in a specific diagnosis/procedure, but a "
+        "review found that it does not clearly reflect it. Revise the record so it "
+        "explicitly and clinically incorporates the code below, changing as little "
+        "else as possible.\n\n"
+        "CODE TO INCORPORATE: $CODE\n"
+        "CLINICAL CONTEXT:\n$CODE_CONTEXT\n\n"
+        "CURRENT ADMISSION RECORD (JSON):\n$CURRENT_ADMISSION\n\n"
+        "Return the revised admission record as a JSON object with the same keys as "
+        "the current record above, updated so that chief_complaint, "
+        "history_of_presenting_complaint / indication, working_diagnosis / "
+        "planned_procedure, and management_plan (whichever of these keys are present) "
+        "clearly and specifically reflect the code above. "
+        "Return ONLY valid JSON."
+    ),
+
+    "correct_note_prompt": Template(
+        "You are an NHS clinician revising a synthetic clinical note. The note below "
+        "was meant to be consistent with a specific diagnosis/procedure, but a review "
+        "found that it does not clearly reflect it. Revise the note so it explicitly "
+        "and clinically incorporates the code below, changing as little else as "
+        "possible and preserving the note's original structure and style.\n\n"
+        "CODE TO INCORPORATE: $CODE\n"
+        "CLINICAL CONTEXT:\n$CODE_CONTEXT\n\n"
+        "CURRENT NOTE TEXT:\n$CURRENT_NOTE\n\n"
+        "Return the revised note text only - no JSON wrapper, no explanatory comments."
     ),
 }

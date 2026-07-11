@@ -2,29 +2,55 @@
 main.py - CLI entrypoint for serverless-journeys Nebius serverless job.
 
 Generates synthetic NHS patient journeys with clinical notes, driven by
-ICD-10 diagnosis codes and/or OPCS-4 procedure codes.
+diagnostic codes and/or procedure codes from any registered coding
+standard (see src/codes/registry.py). Defaults to ICD-10 for diagnoses and
+OPCS-4 for procedures, but --diagnostic-code-system / --procedure-code-system
+can select any other registered system (e.g. ICD-11, SNOMED CT, CPT).
 
 Usage:
-    python main.py [--icd10-codes I21.0,J18.1] [--opcs4-codes K40.1] \\
+    python main.py [--diagnostic-codes I21.0,J18.1] [--procedure-codes K40.1] \\
                    [--n-patients 5] [--output-dir data/output] \\
                    [--model claude-sonnet-4-6] [--llm-provider anthropic]
 
     # Run against a Nebius serverless GPU endpoint instead:
     python main.py --llm-provider nebius \\
                    --model meta-llama/Meta-Llama-3.1-70B-Instruct-fast \\
-                   --icd10-codes I21.0 --n-patients 10
+                   --diagnostic-codes I21.0 --n-patients 10
+
+    # Research uncurated codes via Google Search and let the pipeline
+    # correct any generated content that ends up missing a driving code:
+    python main.py --diagnostic-codes M75.100 --research-unknown-codes \\
+                   --max-correction-attempts 2
+
+After each patient is generated, a backward-pass check confirms each
+driving code is actually reflected in the admission/notes (not just passed
+in as a parameter); on a miss it applies a targeted corrective regeneration
+(see --max-correction-attempts). For codes with no curated dictionary entry
+in src/codes/icd10.py / opcs4.py, --research-unknown-codes looks the code up
+via Google Custom Search first so generation (and any correction) is
+grounded in what the code actually means, not a guess from the bare code.
 
 Environment variables (override CLI args or provide defaults):
-    ANTHROPIC_API_KEY  - required for anthropic provider
-    OPENAI_API_KEY     - required for openai provider
-    NEBIUS_API_KEY     - required for nebius provider
-    NEBIUS_BASE_URL    - Nebius endpoint (default: https://api.studio.nebius.com/v1/)
-    LLM_PROVIDER       - 'anthropic', 'openai', or 'nebius'
-    MODEL              - model identifier (e.g. any model id on your Nebius endpoint)
-    N_PATIENTS         - number of patients to generate
-    ICD10_CODES        - comma-separated ICD-10 codes
-    OPCS4_CODES        - comma-separated OPCS-4 codes
-    OUTPUT_DIR         - output directory path
+    ANTHROPIC_API_KEY       - required for anthropic provider
+    OPENAI_API_KEY          - required for openai provider
+    NEBIUS_API_KEY          - required for nebius provider
+    NEBIUS_BASE_URL         - Nebius endpoint (default: https://api.studio.nebius.com/v1/)
+    LLM_PROVIDER            - 'anthropic', 'openai', or 'nebius'
+    MODEL                   - model identifier (e.g. any model id on your Nebius endpoint)
+    N_PATIENTS              - number of patients to generate
+    DIAGNOSTIC_CODES        - comma-separated diagnostic codes
+    DIAGNOSTIC_CODE_SYSTEM  - diagnostic coding standard, default 'icd10'
+    PROCEDURE_CODES         - comma-separated procedure codes
+    PROCEDURE_CODE_SYSTEM   - procedure coding standard, default 'opcs4'
+    MAX_CORRECTION_ATTEMPTS - corrective regenerations per missed code, default 1
+    RESEARCH_UNKNOWN_CODES  - 'true' to research uncurated codes via web search
+    GOOGLE_SEARCH_API_KEY   - required if RESEARCH_UNKNOWN_CODES is enabled
+    GOOGLE_SEARCH_CSE_ID    - required if RESEARCH_UNKNOWN_CODES is enabled
+    N_EVENTS_PER_PATIENT    - approximate journey events per patient (soft target), default 8
+    TYPO_RATE               - proportion of words to corrupt when APPLY_TYPOS is set, default 0.02
+    MAX_LLM_ATTEMPTS        - retry attempts per LLM call, default 5
+    MIN_LOS_DAYS/MAX_LOS_DAYS - suggested LOS range for no-codes random admissions, default 1/14
+    OUTPUT_DIR              - output directory path
 """
 
 from __future__ import annotations
@@ -33,11 +59,9 @@ import argparse
 import json
 import logging
 import os
-import random
 import sys
 import uuid
-from datetime import datetime, timedelta
-from pathlib import Path
+from datetime import datetime
 from typing import Any
 
 # Load .env file if present (development convenience)
@@ -72,11 +96,17 @@ def _import_project_modules():
     modules: dict[str, Any] = {}
 
     try:
-        modules["params"] = importlib.import_module("config.params")
         modules["config"] = importlib.import_module("config.config")
         modules["processing"] = importlib.import_module("src.processing")
+        # Importing anything under src.codes runs src/codes/__init__.py,
+        # which discovers and registers every CodeSystem from code_systems/
+        # *.json (plus $EXTRA_CODE_SYSTEMS_DIR, if set) - see
+        # src/codes/loader.py. icd10/opcs4 are kept here as convenience
+        # wrapper modules even though this file mostly talks to the
+        # generic registry from here on.
         modules["icd10"] = importlib.import_module("src.codes.icd10")
         modules["opcs4"] = importlib.import_module("src.codes.opcs4")
+        modules["registry"] = importlib.import_module("src.codes.registry")
         modules["doc_templates"] = importlib.import_module("src.doc_templates")
     except ImportError as exc:
         logger.error("Failed to import project modules: %s", exc)
@@ -110,21 +140,54 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--icd10-codes",
+        "--diagnostic-codes",
         type=str,
-        default=os.environ.get("ICD10_CODES", ""),
+        default=os.environ.get("DIAGNOSTIC_CODES", ""),
         help=(
-            "Comma-separated ICD-10 codes to drive admission generation "
-            "(e.g. 'I21.0,J18.1'). Overrides ICD10_CODES env var."
+            "Comma-separated diagnostic codes to drive admission generation "
+            "(e.g. 'I21.0,J18.1'). Overrides DIAGNOSTIC_CODES env var. "
+            "Interpreted under --diagnostic-code-system."
         ),
     )
     parser.add_argument(
-        "--opcs4-codes",
+        "--diagnostic-code-system",
         type=str,
-        default=os.environ.get("OPCS4_CODES", ""),
+        default=os.environ.get("DIAGNOSTIC_CODE_SYSTEM", "icd10"),
         help=(
-            "Comma-separated OPCS-4 procedure codes "
-            "(e.g. 'K40.1,W37.1'). Overrides OPCS4_CODES env var."
+            "Coding standard the --diagnostic-codes belong to (default: 'icd10'). "
+            "Any system with a JSON file under code_systems/ (or "
+            "$EXTRA_CODE_SYSTEMS_DIR) may be used - see src/codes/loader.py "
+            "for the file format to add another standard (e.g. ICD-11, SNOMED CT)."
+        ),
+    )
+    parser.add_argument(
+        "--procedure-codes",
+        type=str,
+        default=os.environ.get("PROCEDURE_CODES", ""),
+        help=(
+            "Comma-separated procedure codes (e.g. 'K40.1,W37.1'). Overrides "
+            "PROCEDURE_CODES env var. Interpreted under --procedure-code-system."
+        ),
+    )
+    parser.add_argument(
+        "--procedure-code-system",
+        type=str,
+        default=os.environ.get("PROCEDURE_CODE_SYSTEM", "opcs4"),
+        help=(
+            "Coding standard the --procedure-codes belong to (default: 'opcs4'). "
+            "Any system with a JSON file under code_systems/ (or "
+            "$EXTRA_CODE_SYSTEMS_DIR) may be used (e.g. CPT, HCPCS)."
+        ),
+    )
+    parser.add_argument(
+        "--n-events-per-patient",
+        type=int,
+        default=int(os.environ.get("N_EVENTS_PER_PATIENT", "8")),
+        help=(
+            "Approximate number of journey events (and therefore clinical notes) to "
+            "aim for per patient (default: 8). A soft guide passed into the journey "
+            "prompt, not a hard cap - actual length of stay and admission type still "
+            "shape the real count."
         ),
     )
     parser.add_argument(
@@ -168,6 +231,40 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--research-unknown-codes",
+        action="store_true",
+        default=os.environ.get("RESEARCH_UNKNOWN_CODES", "false").lower() == "true",
+        help=(
+            "Look up diagnostic/procedure codes with no curated dictionary entry via "
+            "Google Custom Search before generation, so the LLM has real clinical "
+            "grounding instead of guessing from the bare code alone. Requires "
+            "GOOGLE_SEARCH_API_KEY and GOOGLE_SEARCH_CSE_ID. Adds latency/cost per "
+            "unique uncurated code (results are cached for the run)."
+        ),
+    )
+    parser.add_argument(
+        "--max-correction-attempts",
+        type=int,
+        default=int(os.environ.get("MAX_CORRECTION_ATTEMPTS", "1")),
+        help=(
+            "Max targeted corrective regenerations per driving code that the "
+            "backward-pass check finds missing from the generated admission/notes "
+            "(edits just the admission record and first note, not a full patient "
+            "re-run). Set to 0 to disable correction (check-only). Default: 1."
+        ),
+    )
+    parser.add_argument(
+        "--evaluate-notes",
+        action="store_true",
+        default=os.environ.get("EVALUATE_NOTES", "false").lower() == "true",
+        help=(
+            "Score generated notes after generation completes: objective readability "
+            "(free) plus LLM-judged fluency/groundedness/relevance (3 extra LLM calls "
+            "per note). Scores are attached as extra columns on each note and averaged "
+            "into generation_summary.json / the run summary. Off by default."
+        ),
+    )
+    parser.add_argument(
         "--apply-abbreviations",
         action="store_true",
         default=os.environ.get("APPLY_ABBREVIATIONS", "false").lower() == "true",
@@ -178,6 +275,36 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         default=os.environ.get("APPLY_TYPOS", "false").lower() == "true",
         help="Apply realistic typo augmentation to generated notes.",
+    )
+    parser.add_argument(
+        "--typo-rate",
+        type=float,
+        default=float(os.environ.get("TYPO_RATE", "0.02")),
+        help="Approximate proportion of words to corrupt when --apply-typos is set (default: 0.02).",
+    )
+    parser.add_argument(
+        "--max-llm-attempts",
+        type=int,
+        default=int(os.environ.get("MAX_LLM_ATTEMPTS", "5")),
+        help="Max retry attempts per LLM call before giving up (default: 5).",
+    )
+    parser.add_argument(
+        "--min-los-days",
+        type=int,
+        default=int(os.environ.get("MIN_LOS_DAYS", "1")),
+        help=(
+            "Minimum length of stay (days) suggested to the LLM for randomly generated "
+            "admissions when no diagnostic/procedure codes are given (default: 1)."
+        ),
+    )
+    parser.add_argument(
+        "--max-los-days",
+        type=int,
+        default=int(os.environ.get("MAX_LOS_DAYS", "14")),
+        help=(
+            "Maximum length of stay (days) suggested to the LLM for randomly generated "
+            "admissions when no diagnostic/procedure codes are given (default: 14)."
+        ),
     )
     parser.add_argument(
         "--admission-date",
@@ -224,7 +351,14 @@ def _stub_patient(index: int) -> dict:
     }
 
 
-def _stub_admission(patient: dict, admission_date: str, icd10_codes: list, opcs4_codes: list) -> dict:
+def _stub_admission(
+    patient: dict,
+    admission_date: str,
+    diagnostic_codes: list,
+    diagnostic_code_system: str,
+    procedure_codes: list,
+    procedure_code_system: str,
+) -> dict:
     """Return stub admission data for test mode."""
     return {
         "admission_id": str(uuid.uuid4()),
@@ -232,8 +366,10 @@ def _stub_admission(patient: dict, admission_date: str, icd10_codes: list, opcs4
         "admission_type": "emergency",
         "admission_method": "Emergency department",
         "admission_date": admission_date,
-        "icd10_codes": icd10_codes,
-        "opcs4_codes": opcs4_codes,
+        "diagnostic_codes": diagnostic_codes,
+        "diagnostic_code_system": diagnostic_code_system if diagnostic_codes else None,
+        "procedure_codes": procedure_codes,
+        "procedure_code_system": procedure_code_system if procedure_codes else None,
         "specialty": "General Medicine",
         "ward": "Medical Assessment Unit (MAU)",
         "estimated_los_days": 4,
@@ -283,47 +419,60 @@ def _stub_note(event: dict, patient: dict) -> str:
 
 
 def step_parse_codes(
-    icd10_str: str,
-    opcs4_str: str,
+    diagnostic_codes_str: str,
+    diagnostic_code_system: str,
+    procedure_codes_str: str,
+    procedure_code_system: str,
     mods: dict,
 ) -> tuple[list[str], list[str]]:
-    """Parse ICD-10 and OPCS-4 code strings into validated lists.
+    """Parse and validate diagnostic/procedure code strings.
+
+    Works for any code system registered in src/codes/registry.py, not just
+    the built-in ICD-10/OPCS-4 - diagnostic_code_system and
+    procedure_code_system select which registered CodeSystem to validate
+    and look up descriptions against.
 
     Args:
-        icd10_str: Comma-separated ICD-10 code string.
-        opcs4_str: Comma-separated OPCS-4 code string.
+        diagnostic_codes_str: Comma-separated diagnostic code string.
+        diagnostic_code_system: Registry key for the diagnostic code system.
+        procedure_codes_str: Comma-separated procedure code string.
+        procedure_code_system: Registry key for the procedure code system.
         mods: Module namespace dict.
 
     Returns:
-        Tuple of (icd10_codes, opcs4_codes) lists.
+        Tuple of (diagnostic_codes, procedure_codes) lists.
     """
-    icd10_codes = mods["icd10"].parse_codes(icd10_str)
-    opcs4_codes = mods["opcs4"].parse_codes(opcs4_str)
+    registry = mods["registry"]
 
-    if icd10_codes:
-        logger.info("ICD-10 codes: %s", ", ".join(icd10_codes))
-        for code in icd10_codes:
-            info = mods["icd10"].lookup_code(code)
+    diagnostic_codes = registry.parse_codes(diagnostic_codes_str)
+    procedure_codes = registry.parse_codes(procedure_codes_str)
+
+    if diagnostic_codes:
+        diag_system = registry.get_code_system(diagnostic_code_system)
+        logger.info("%s (diagnostic) codes: %s", diag_system.name, ", ".join(diagnostic_codes))
+        for code in diagnostic_codes:
+            info = registry.lookup_code(diag_system, code)
             if info:
-                logger.info("  %s: %s (%s)", code, info["description"], info["specialty"])
+                specialty = info.get(diag_system.specialty_field, "")
+                logger.info("  %s: %s (%s)", code, info.get("description", ""), specialty)
             else:
-                logger.warning("  %s: not found in curated dictionary", code)
+                logger.warning("  %s: not found in curated %s dictionary", code, diag_system.name)
 
-    if opcs4_codes:
-        logger.info("OPCS-4 codes: %s", ", ".join(opcs4_codes))
-        for code in opcs4_codes:
-            info = mods["opcs4"].lookup_code(code)
+    if procedure_codes:
+        proc_system = registry.get_code_system(procedure_code_system)
+        logger.info("%s (procedure) codes: %s", proc_system.name, ", ".join(procedure_codes))
+        for code in procedure_codes:
+            info = registry.lookup_code(proc_system, code)
             if info:
-                logger.info(
-                    "  %s: %s (%s)", code, info["description"], info["surgical_specialty"]
-                )
+                specialty = info.get(proc_system.specialty_field, "")
+                logger.info("  %s: %s (%s)", code, info.get("description", ""), specialty)
             else:
-                logger.warning("  %s: not found in curated dictionary", code)
+                logger.warning("  %s: not found in curated %s dictionary", code, proc_system.name)
 
-    if not icd10_codes and not opcs4_codes:
+    if not diagnostic_codes and not procedure_codes:
         logger.info("No codes provided - will generate random admissions")
 
-    return icd10_codes, opcs4_codes
+    return diagnostic_codes, procedure_codes
 
 
 def step_generate_patient(
@@ -356,39 +505,58 @@ def step_generate_patient(
 
 def step_generate_admission(
     patient: dict,
-    icd10_codes: list[str],
-    opcs4_codes: list[str],
+    diagnostic_codes: list[str],
+    diagnostic_code_system: str,
+    procedure_codes: list[str],
+    procedure_code_system: str,
     admission_date: str,
     mods: dict,
     model: str | None,
     test_mode: bool,
+    enable_code_research: bool = False,
+    min_los_days: int = 1,
+    max_los_days: int = 14,
 ) -> dict:
     """Generate an admission record for a patient.
 
     Args:
         patient: Patient demographics dict.
-        icd10_codes: List of ICD-10 codes (may be empty).
-        opcs4_codes: List of OPCS-4 codes (may be empty).
+        diagnostic_codes: List of diagnostic codes (may be empty).
+        diagnostic_code_system: Registry key for the diagnostic code system.
+        procedure_codes: List of procedure codes (may be empty).
+        procedure_code_system: Registry key for the procedure code system.
         admission_date: ISO date string.
         mods: Module namespace dict.
         model: Optional model override.
         test_mode: If True, return stub data.
+        enable_code_research: If True, research uncurated codes via web
+            search before generation (see src.codes.research).
+        min_los_days: Minimum LOS to suggest when no codes are given.
+        max_los_days: Maximum LOS to suggest when no codes are given.
 
     Returns:
         Admission details dict.
     """
     if test_mode:
-        return _stub_admission(patient, admission_date, icd10_codes, opcs4_codes)
+        return _stub_admission(
+            patient, admission_date, diagnostic_codes, diagnostic_code_system,
+            procedure_codes, procedure_code_system,
+        )
 
     logger.info("  Generating admission...")
     admission_time = mods["processing"].random_24_hour_time()
     admission = mods["processing"].generate_from_codes(
-        icd10_codes=icd10_codes,
-        opcs4_codes=opcs4_codes,
+        diagnostic_codes=diagnostic_codes,
+        procedure_codes=procedure_codes,
         patient_details=patient,
         admission_date=admission_date,
         admission_time=admission_time,
         model=model,
+        diagnostic_code_system=diagnostic_code_system,
+        procedure_code_system=procedure_code_system,
+        enable_code_research=enable_code_research,
+        min_los_days=min_los_days,
+        max_los_days=max_los_days,
     )
     admission["admission_id"] = str(uuid.uuid4())
     admission["patient_id"] = patient.get("person_id", str(uuid.uuid4()))
@@ -409,6 +577,7 @@ def step_generate_journey(
     mods: dict,
     model: str | None,
     test_mode: bool,
+    target_event_count: int = 8,
 ) -> tuple[list[dict], str, str]:
     """Generate a patient journey (sequence of events).
 
@@ -419,6 +588,8 @@ def step_generate_journey(
         mods: Module namespace dict.
         model: Optional model override.
         test_mode: If True, return stub data.
+        target_event_count: Approximate number of events to aim for - a
+            soft guide, not a hard cap (see processing.generate_journey).
 
     Returns:
         Tuple of (journey_events, admission_date, discharge_date).
@@ -444,6 +615,7 @@ def step_generate_journey(
         discharge_date=discharge_dt,
         possible_event_types=mods["config"].possible_event_types,
         model=model,
+        target_event_count=target_event_count,
     )
     logger.info("  Generated %d journey events", len(journey))
     return journey, admission_dt, discharge_dt
@@ -458,6 +630,7 @@ def step_generate_notes(
     test_mode: bool,
     apply_abbreviations: bool,
     apply_typos: bool,
+    typo_rate: float = 0.02,
 ) -> list[dict]:
     """Generate clinical notes for each event in a patient journey.
 
@@ -470,6 +643,7 @@ def step_generate_notes(
         test_mode: If True, return stub notes.
         apply_abbreviations: Whether to apply abbreviation augmentation.
         apply_typos: Whether to apply typo augmentation.
+        typo_rate: Approximate proportion of words to corrupt when apply_typos is True.
 
     Returns:
         List of clinical note dicts.
@@ -543,7 +717,7 @@ def step_generate_notes(
 
             if apply_typos and len(note_text) > 100:
                 try:
-                    note_text = mods["processing"].add_typos_to_string(note_text)
+                    note_text = mods["processing"].add_typos_to_string(note_text, typo_rate=typo_rate)
                 except Exception as exc:  # noqa: BLE001
                     logger.debug("Typo augmentation failed: %s", exc)
 
@@ -566,6 +740,175 @@ def step_generate_notes(
     return notes
 
 
+def _select_note_for_correction(notes: list[dict], role: str) -> dict | None:
+    """Pick which note a corrective rewrite should target.
+
+    A procedure code belongs in an 'operation' note if the journey
+    generated one; anything else (including diagnostic codes) falls back
+    to the earliest note, which is typically the admission-defining
+    ED/ward-round note where a diagnosis first gets documented.
+
+    Args:
+        notes: Generated clinical note list.
+        role: 'diagnostic' or 'procedure'.
+
+    Returns:
+        The note dict to correct, or None if notes is empty.
+    """
+    if not notes:
+        return None
+    if role == "procedure":
+        for note in notes:
+            if note.get("note_type") == "operation":
+                return note
+    return notes[0]
+
+
+def step_verify_code_reflection(
+    patient: dict,
+    admission: dict,
+    journey: list[dict],
+    notes: list[dict],
+    diagnostic_codes: list[str],
+    diagnostic_code_system: str,
+    procedure_codes: list[str],
+    procedure_code_system: str,
+    mods: dict,
+    patient_idx: int,
+    model: str | None,
+    enable_code_research: bool,
+    max_correction_attempts: int,
+) -> dict:
+    """Backward-pass check, with bounded targeted correction on a miss.
+
+    Runs src.processing.check_code_reflected for every diagnostic and
+    procedure code that drove this admission. For any code not reflected in
+    the admission or notes, attempts up to max_correction_attempts targeted
+    corrective regenerations (processing.correct_admission_for_code /
+    correct_note_for_code - editing just the admission record and one
+    journey note, not a full patient re-run), re-checking after each
+    attempt and stopping early once the code is reflected. `admission` and
+    `notes` are mutated in place by any corrections applied. Codes still
+    unreflected after all attempts are logged as warnings.
+
+    Args:
+        patient: Generated patient dict.
+        admission: Generated admission dict (mutated in place on correction).
+        journey: Generated journey event list.
+        notes: Generated clinical note list (one entry mutated in place on
+            correction, if any notes exist - see _select_note_for_correction).
+        diagnostic_codes: Diagnostic codes that drove this admission.
+        diagnostic_code_system: Registry key for the diagnostic code system.
+        procedure_codes: Procedure codes that drove this admission.
+        procedure_code_system: Registry key for the procedure code system.
+        mods: Module namespace dict.
+        patient_idx: 1-based patient index, for log messages.
+        model: Optional LLM model override for correction calls.
+        enable_code_research: Whether to research uncurated codes for
+            correction context (see src.codes.research).
+        max_correction_attempts: Max corrective regeneration attempts per
+            unreflected code. 0 disables correction (check-only, matching
+            the previous behaviour).
+
+    Returns:
+        Dict mapping each code to its final per-part reflection result
+        (after any corrections). Keys are "<role>:<code>" (role is
+        'diagnostic' or 'procedure') rather than the bare code, since a
+        diagnostic and procedure code can share the same string (e.g.
+        'J18.1' is a valid key in both the curated ICD-10 and OPCS-4
+        dictionaries) and a bare-code key would silently let one
+        overwrite the other's result.
+    """
+    processing = mods["processing"]
+    report: dict[str, dict[str, bool]] = {}
+
+    all_codes = [(c, diagnostic_code_system, "diagnostic") for c in diagnostic_codes] + [
+        (c, procedure_code_system, "procedure") for c in procedure_codes
+    ]
+
+    for code, code_system, role in all_codes:
+        result = processing.check_code_reflected(code, code_system, patient, admission, journey, notes)
+
+        attempts = 0
+        while not (result["admission"] or result["notes"]) and attempts < max_correction_attempts:
+            attempts += 1
+            logger.info(
+                "  Patient %d: correcting %s code %s (%s), attempt %d/%d",
+                patient_idx, role, code, code_system, attempts, max_correction_attempts,
+            )
+            code_context = processing.get_code_context(
+                code_system, code, enable_research=enable_code_research, model=model
+            )
+            admission.update(
+                processing.correct_admission_for_code(admission, code, code_context, model=model)
+            )
+            target_note = _select_note_for_correction(notes, role)
+            if target_note is not None:
+                corrected_text = processing.correct_note_for_code(
+                    target_note.get("clean_note_text", ""), code, code_context, model=model
+                )
+                target_note["clean_note_text"] = corrected_text
+                target_note["raw_blob_content"] = corrected_text
+
+            result = processing.check_code_reflected(
+                code, code_system, patient, admission, journey, notes
+            )
+
+        report[f"{role}:{code}"] = result
+        if not (result["admission"] or result["notes"]):
+            suffix = f" after {attempts} correction attempt(s)" if attempts else ""
+            logger.warning(
+                "  Patient %d: %s code %s (%s) not reflected in admission or notes%s",
+                patient_idx, role, code, code_system, suffix,
+            )
+        elif attempts:
+            logger.info(
+                "  Patient %d: %s code %s (%s) reflected after %d correction attempt(s)",
+                patient_idx, role, code, code_system, attempts,
+            )
+
+    return report
+
+
+def step_evaluate_notes(
+    admission: dict,
+    patient: dict,
+    notes: list[dict],
+    mods: dict,
+    model: str | None,
+) -> None:
+    """Score each note's readability and (LLM-judged) fluency/groundedness/
+    relevance, attaching the scores directly onto the note record.
+
+    Runs after any correction (step_verify_code_reflection) so it scores
+    the final note text, not a pre-correction draft. Mutates each dict in
+    `notes` in place by merging in the extra score columns - failures on
+    an individual note are logged and leave that note's scores as None
+    rather than aborting the whole patient.
+
+    Args:
+        admission: Generated admission dict, used as reference material
+            for groundedness/relevance judging.
+        patient: Generated patient dict, included in reference material.
+        notes: Generated clinical note list (mutated in place).
+        mods: Module namespace dict.
+        model: Optional LLM model override.
+    """
+    processing = mods["processing"]
+    reference_material = json.dumps(
+        {"patient": patient, "admission": admission}, indent=2, default=str
+    )
+
+    for note in notes:
+        try:
+            scores = processing.evaluate_note(
+                note.get("clean_note_text", ""), reference_material, model=model
+            )
+            note.update(scores)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("  Note evaluation failed for note %s: %s", note.get("clinical_note_id"), exc)
+
+
 # ---------------------------------------------------------------------------
 # Output helpers
 # ---------------------------------------------------------------------------
@@ -576,6 +919,7 @@ def save_outputs(
     all_admissions: list[dict],
     all_journeys: list[list[dict]],
     all_notes: list[list[dict]],
+    all_code_reflection_reports: list[dict],
     output_dir: str,
     mods: dict,
 ) -> None:
@@ -586,6 +930,8 @@ def save_outputs(
         all_admissions: List of admission dicts.
         all_journeys: List of journey event lists.
         all_notes: List of clinical note lists.
+        all_code_reflection_reports: List of per-patient code reflection
+            check reports (see step_verify_code_reflection).
         output_dir: Directory to write CSV files.
         mods: Module namespace dict.
     """
@@ -643,7 +989,8 @@ def save_outputs(
 
     # Summary JSON
     summary = mods["processing"].build_output_info(
-        all_patients, all_admissions, all_journeys, all_notes
+        all_patients, all_admissions, all_journeys, all_notes,
+        code_reflection_reports=all_code_reflection_reports,
     )
     summary_path = os.path.join(output_dir, "generation_summary.json")
     with open(summary_path, "w") as f:
@@ -656,7 +1003,9 @@ def print_summary(
     all_admissions: list[dict],
     all_journeys: list[list[dict]],
     all_notes: list[list[dict]],
+    all_code_reflection_reports: list[dict],
     output_dir: str,
+    mods: dict,
 ) -> None:
     """Print a human-readable summary of the generation run to stdout.
 
@@ -665,7 +1014,10 @@ def print_summary(
         all_admissions: List of admission dicts.
         all_journeys: List of journey event lists.
         all_notes: List of clinical note lists.
+        all_code_reflection_reports: List of per-patient code reflection
+            check reports (see step_verify_code_reflection).
         output_dir: Output directory path.
+        mods: Module namespace dict.
     """
     total_events = sum(len(j) for j in all_journeys)
     total_notes = sum(len(n) for n in all_notes)
@@ -693,6 +1045,26 @@ def print_summary(
     print(f"\nNote type distribution:")
     for nt, count in sorted(note_type_counts.items(), key=lambda x: -x[1]):
         print(f"  {nt:<35} {count:>4}")
+
+    if all_code_reflection_reports:
+        total_codes = 0
+        reflected_codes = 0
+        for report in all_code_reflection_reports:
+            for result in report.values():
+                total_codes += 1
+                if result["admission"] or result["notes"]:
+                    reflected_codes += 1
+        print(f"\nDiagnostic/procedure code reflection (backward-pass check):")
+        print(f"  {reflected_codes}/{total_codes} codes reflected in admission or notes")
+        if reflected_codes < total_codes:
+            print("  See generation_summary.json / logs for codes that weren't reflected.")
+
+    quality_metrics = mods["processing"].average_note_quality_metrics(all_notes)
+    if quality_metrics:
+        print(f"\nNote quality metrics (averages):")
+        for key, value in sorted(quality_metrics.items()):
+            print(f"  {key:<28} {value:.2f}")
+
     print(f"\nOutput directory: {os.path.abspath(output_dir)}")
     print("=" * 60 + "\n")
 
@@ -723,6 +1095,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
     os.environ["LLM_PROVIDER"] = args.llm_provider
     if args.model:
         os.environ["MODEL"] = args.model
+    os.environ["MAX_LLM_ATTEMPTS"] = str(args.max_llm_attempts)
 
     # Import project modules
     try:
@@ -731,10 +1104,18 @@ def run_pipeline(args: argparse.Namespace) -> int:
         logger.error("Module import failed: %s", exc)
         return 1
 
+    diagnostic_code_system = args.diagnostic_code_system
+    procedure_code_system = args.procedure_code_system
+
     # Parse and validate codes
-    icd10_codes, opcs4_codes = step_parse_codes(
-        args.icd10_codes, args.opcs4_codes, mods
-    )
+    try:
+        diagnostic_codes, procedure_codes = step_parse_codes(
+            args.diagnostic_codes, diagnostic_code_system,
+            args.procedure_codes, procedure_code_system, mods,
+        )
+    except KeyError as exc:
+        logger.error("Invalid code system: %s", exc)
+        return 1
 
     # Determine model
     model: str | None = args.model or None
@@ -744,6 +1125,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
     all_admissions: list[dict] = []
     all_journeys: list[list[dict]] = []
     all_notes: list[list[dict]] = []
+    all_code_reflection_reports: list[dict] = []
 
     n_patients = 1 if args.test_mode else args.n_patients
     admission_date = args.admission_date
@@ -760,13 +1142,17 @@ def run_pipeline(args: argparse.Namespace) -> int:
 
             # Step 2: Generate admission (code-driven or random)
             admission = step_generate_admission(
-                patient, icd10_codes, opcs4_codes,
-                admission_date, mods, model, args.test_mode
+                patient, diagnostic_codes, diagnostic_code_system,
+                procedure_codes, procedure_code_system,
+                admission_date, mods, model, args.test_mode,
+                args.research_unknown_codes,
+                args.min_los_days, args.max_los_days,
             )
 
             # Step 3: Generate patient journey
             journey, adm_date, dis_date = step_generate_journey(
-                patient, admission, admission_date, mods, model, args.test_mode
+                patient, admission, admission_date, mods, model, args.test_mode,
+                args.n_events_per_patient,
             )
             admission["discharge_date"] = dis_date
 
@@ -776,8 +1162,29 @@ def run_pipeline(args: argparse.Namespace) -> int:
             )
             notes = step_generate_notes(
                 patient, admission, journey, mods, model,
-                args.test_mode, args.apply_abbreviations, args.apply_typos
+                args.test_mode, args.apply_abbreviations, args.apply_typos,
+                args.typo_rate,
             )
+
+            # Step 5: Backward-pass check (+ targeted correction on a miss) -
+            # do the driving codes actually show up in what got generated?
+            # Skipped in test mode, since stub notes are placeholder text
+            # with no clinical content.
+            if not args.test_mode and (diagnostic_codes or procedure_codes):
+                reflection_report = step_verify_code_reflection(
+                    patient, admission, journey, notes,
+                    diagnostic_codes, diagnostic_code_system,
+                    procedure_codes, procedure_code_system,
+                    mods, patient_idx, model,
+                    args.research_unknown_codes, args.max_correction_attempts,
+                )
+                admission["code_reflection_check"] = reflection_report
+                all_code_reflection_reports.append(reflection_report)
+
+            # Step 6: Quality evaluation (opt-in) - scores the final note
+            # text, after any correction above.
+            if not args.test_mode and args.evaluate_notes:
+                step_evaluate_notes(admission, patient, notes, mods, model)
 
             all_patients.append(patient)
             all_admissions.append(admission)
@@ -806,14 +1213,17 @@ def run_pipeline(args: argparse.Namespace) -> int:
     try:
         save_outputs(
             all_patients, all_admissions, all_journeys, all_notes,
-            args.output_dir, mods
+            all_code_reflection_reports, args.output_dir, mods
         )
     except Exception as exc:  # noqa: BLE001
         logger.error("Failed to save outputs: %s", exc, exc_info=args.verbose)
         return 1
 
     # Print summary
-    print_summary(all_patients, all_admissions, all_journeys, all_notes, args.output_dir)
+    print_summary(
+        all_patients, all_admissions, all_journeys, all_notes,
+        all_code_reflection_reports, args.output_dir, mods
+    )
 
     logger.info("Pipeline completed successfully.")
     return 0
