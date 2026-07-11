@@ -1329,6 +1329,7 @@ def generate_journey(
     discharge_date: str,
     possible_event_types: list[str],
     model: str | None = None,
+    target_event_count: int = 8,
 ) -> list[dict]:
     """Generate a sequence of clinical events for a patient journey.
 
@@ -1339,6 +1340,10 @@ def generate_journey(
         discharge_date: ISO date string.
         possible_event_types: List of valid event type names.
         model: Optional model override.
+        target_event_count: Approximate number of events to aim for - a
+            soft guide passed into the prompt, not a hard cap. The LLM is
+            explicitly told actual clinical realism (LOS, admission type)
+            takes priority over hitting this exactly.
 
     Returns:
         List of event dicts ordered chronologically.
@@ -1355,6 +1360,7 @@ def generate_journey(
         ADMISSION_DATE=admission_date,
         DISCHARGE_DATE=discharge_date,
         POSSIBLE_EVENT_TYPES=event_types_str,
+        TARGET_EVENT_COUNT=str(target_event_count),
     )
 
     response = call_llm(prompt, model=model, temp=0.8)

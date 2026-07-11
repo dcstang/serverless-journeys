@@ -244,3 +244,47 @@ class TestForwardPassPropagatesIntoJourneyAndNotes:
         )
 
         assert "I21.0" in captured["prompt"]
+
+
+class TestJourneyTargetEventCount:
+    """N_EVENTS_PER_PATIENT / --n-events-per-patient: a soft target passed
+    into the journey prompt, not a hard cap enforced in code."""
+
+    def test_default_target_is_eight(self, monkeypatch, sample_patient):
+        captured = {}
+
+        def fake_call_llm(prompt, model=None, temp=0.7, **kwargs):
+            captured["prompt"] = prompt
+            return json.dumps([])
+
+        monkeypatch.setattr(processing, "call_llm", fake_call_llm)
+
+        processing.generate_journey(
+            patient=sample_patient,
+            admission={"diagnostic_codes": ["I21.0"]},
+            admission_date="2026-07-08",
+            discharge_date="2026-07-12",
+            possible_event_types=["ED event", "general ward round"],
+        )
+
+        assert "TARGET NUMBER OF EVENTS: approximately 8" in captured["prompt"]
+
+    def test_custom_target_is_passed_through_to_prompt(self, monkeypatch, sample_patient):
+        captured = {}
+
+        def fake_call_llm(prompt, model=None, temp=0.7, **kwargs):
+            captured["prompt"] = prompt
+            return json.dumps([])
+
+        monkeypatch.setattr(processing, "call_llm", fake_call_llm)
+
+        processing.generate_journey(
+            patient=sample_patient,
+            admission={"diagnostic_codes": ["I21.0"]},
+            admission_date="2026-07-08",
+            discharge_date="2026-07-12",
+            possible_event_types=["ED event", "general ward round"],
+            target_event_count=20,
+        )
+
+        assert "TARGET NUMBER OF EVENTS: approximately 20" in captured["prompt"]

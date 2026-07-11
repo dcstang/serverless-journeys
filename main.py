@@ -176,6 +176,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--n-events-per-patient",
+        type=int,
+        default=int(os.environ.get("N_EVENTS_PER_PATIENT", "8")),
+        help=(
+            "Approximate number of journey events (and therefore clinical notes) to "
+            "aim for per patient (default: 8). A soft guide passed into the journey "
+            "prompt, not a hard cap - actual length of stay and admission type still "
+            "shape the real count."
+        ),
+    )
+    parser.add_argument(
         "--n-patients",
         type=int,
         default=int(os.environ.get("N_PATIENTS", "5")),
@@ -515,6 +526,7 @@ def step_generate_journey(
     mods: dict,
     model: str | None,
     test_mode: bool,
+    target_event_count: int = 8,
 ) -> tuple[list[dict], str, str]:
     """Generate a patient journey (sequence of events).
 
@@ -525,6 +537,8 @@ def step_generate_journey(
         mods: Module namespace dict.
         model: Optional model override.
         test_mode: If True, return stub data.
+        target_event_count: Approximate number of events to aim for - a
+            soft guide, not a hard cap (see processing.generate_journey).
 
     Returns:
         Tuple of (journey_events, admission_date, discharge_date).
@@ -550,6 +564,7 @@ def step_generate_journey(
         discharge_date=discharge_dt,
         possible_event_types=mods["config"].possible_event_types,
         model=model,
+        target_event_count=target_event_count,
     )
     logger.info("  Generated %d journey events", len(journey))
     return journey, admission_dt, discharge_dt
@@ -1004,7 +1019,8 @@ def run_pipeline(args: argparse.Namespace) -> int:
 
             # Step 3: Generate patient journey
             journey, adm_date, dis_date = step_generate_journey(
-                patient, admission, admission_date, mods, model, args.test_mode
+                patient, admission, admission_date, mods, model, args.test_mode,
+                args.n_events_per_patient,
             )
             admission["discharge_date"] = dis_date
 

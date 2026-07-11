@@ -173,3 +173,44 @@ class TestReflectionCheckWiredIntoRealPipeline:
                     "--output-dir", str(tmp_path),
                 ]
             )
+
+
+class TestNEventsPerPatientReachesJourneyPrompt:
+    def test_default_flag_value_is_eight(self, tmp_path):
+        args = main.parse_args(["--output-dir", str(tmp_path)])
+        assert args.n_events_per_patient == 8
+
+    def test_custom_value_reaches_the_journey_prompt(self, tmp_path, monkeypatch):
+        code = "I21.0"
+        captured = {}
+
+        def fake_call_llm(prompt, model=None, temp=0.7, **kwargs):
+            if "no resemblance to any real person" in prompt:
+                return json.dumps(
+                    {
+                        "full_name": "Test Patient", "first_name": "Test", "surname": "Patient",
+                        "age": 60, "sex": "Male", "nhs_number": "123 456 7890", "mrn": "1234567",
+                    }
+                )
+            if "Return ONLY a valid JSON array" in prompt:
+                captured["journey_prompt"] = prompt
+                return json.dumps([])
+            if "Write the note text only" in prompt:
+                return "Clinical note text."
+            return json.dumps({"admission_type": "emergency", "estimated_los_days": 5})
+
+        monkeypatch.setattr(processing, "call_llm", fake_call_llm)
+
+        args = main.parse_args(
+            [
+                "--diagnostic-codes", code,
+                "--n-patients", "1",
+                "--n-events-per-patient", "15",
+                "--output-dir", str(tmp_path),
+                "--max-correction-attempts", "0",
+            ]
+        )
+        exit_code = main.run_pipeline(args)
+        assert exit_code == 0
+
+        assert "TARGET NUMBER OF EVENTS: approximately 15" in captured["journey_prompt"]
