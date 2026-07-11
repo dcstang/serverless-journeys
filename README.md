@@ -33,6 +33,8 @@ output, or need an always-on GPU endpoint to run at all. This project:
 
 ## How it works
 
+![Pipeline overview: code-driven generation, then backward-pass verification and quality control](assets/Serverless_Clinical_Narrative_Pipeline_Overview.png)
+
 For each patient, `main.py` runs a fixed pipeline (`run_pipeline` in
 `main.py`):
 
