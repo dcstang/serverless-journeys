@@ -180,7 +180,7 @@
       ]
     },
     "K35.8": {
-      "description": "Acute appendicitis with other complications",
+      "description": "Acute appendicitis, other and unspecified",
       "chapter_name": "Diseases of the digestive system",
       "specialty": "General Surgery",
       "admission_type": "emergency",
@@ -559,8 +559,8 @@
         2
       ]
     },
-    "K56.6": {
-      "description": "Ileus, unspecified (intestinal obstruction)",
+    "K56.7": {
+      "description": "Ileus, unspecified",
       "chapter_name": "Diseases of the digestive system",
       "specialty": "General Surgery",
       "admission_type": "emergency",
@@ -670,7 +670,7 @@
       ]
     },
     "M80.0": {
-      "description": "Age-related osteoporosis with current pathological fracture",
+      "description": "Postmenopausal osteoporosis with pathological fracture",
       "chapter_name": "Diseases of the musculoskeletal system and connective tissue",
       "specialty": "Trauma and Orthopaedics / Rheumatology",
       "admission_type": "emergency",
