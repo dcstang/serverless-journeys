@@ -100,11 +100,50 @@ running afterward. A second, GPU-free image exists for when you'd
 rather call an already-running Nebius AI Studio endpoint (or
 Anthropic/OpenAI) instead of self-hosting the model.
 
+### One patient at a time was never the plan
+
+The pipeline above describes one `I21.0` patient. Ask for fifty and,
+until recently, they generated one after another — each waiting on the
+last note's LLM call before starting the next patient. `--concurrency`
+fans that out: each patient's pipeline is independent, so a thread pool
+runs several at once, bounded by whatever your LLM provider (or your
+local vLLM server) can actually handle concurrently. A failed patient
+in one worker doesn't touch the others, and the output rows land back
+in the same order they would have sequentially — concurrency changes
+how fast the batch finishes, not what it looks like once it has.
+
+### Evaluation that acts, not just measures
+
+The backward pass catches "the code isn't in here." It doesn't catch
+"the code is in here, but the note is repetitive, invents a lab result
+that was never in the admission, or just reads badly." That's a
+different, harder question, and it's the one `--evaluate-notes` now
+asks properly: alongside readability and the existing fluency/
+groundedness/relevance scores, two new LLM-judged metrics —
+**factuality** (an auditable count of clinical claims the note makes
+that the reference material doesn't support, not just a vague 0–1
+score) and **redundancy** (how much of the note is repetition or
+filler versus distinct clinical content). And because grading your own
+homework is a bad idea, the grading now happens on a separate, larger
+**judge model** by default, not the model that wrote the note.
+
+Scoring alone doesn't fix anything, though, which is why a note that
+falls below the quality bar on any of those metrics gets a single
+targeted rewrite and a re-score — the same "check, then fix" shape as
+the code-reflection backward pass, aimed at prose quality instead of
+code coverage. And for notes with no ground-truth version to compare
+against at all, `--self-consistency-n` generates the same note several
+times and checks whether the driving codes show up consistently across
+those generations — a note that only reflects `I21.0` in one out of
+four attempts is telling you something about how stable that generation
+was, before a single judge-model call is spent on it.
+
 ---
 
 That's what it feels like from the outside: ask for a code, get back a
-verified patient. Here's what actually happens between those two
-moments — still following `I21.0` all the way through.
+verified, quality-checked patient, as many at once as your provider can
+take. Here's what actually happens between those moments — still
+following `I21.0` all the way through.
 
 ## Technical breakdown
 
@@ -128,6 +167,46 @@ Nebius's endpoint is OpenAI-wire-compatible — Nebius support is just
 with exponential backoff and raise after `MAX_LLM_ATTEMPTS`. If a
 patient throws at any stage, it's logged and skipped — the batch keeps
 going rather than aborting the whole run.
+
+### Fanning that out across patients
+
+That per-patient pipeline is what got wrapped in a
+`ThreadPoolExecutor`. Every LLM call in it is I/O-bound — the process
+is mostly waiting on a network response — which makes patients an easy
+unit of parallelism: nothing in one patient's generation reads or
+writes another's state.
+
+```python
+concurrency = 1 if args.test_mode else max(1, args.concurrency)
+results: list[tuple[int, dict[str, Any] | None]] = []
+
+if concurrency == 1:
+    for patient_idx in range(1, n_patients + 1):
+        results.append((patient_idx, _generate_one_patient(patient_idx)))
+else:
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        future_to_idx = {
+            executor.submit(_generate_one_patient, patient_idx): patient_idx
+            for patient_idx in range(1, n_patients + 1)
+        }
+        for future in as_completed(future_to_idx):
+            results.append((future_to_idx[future], future.result()))
+
+for patient_idx, result in sorted(results, key=lambda r: r[0]):
+    ...  # append result["patient"]/["admission"]/["journey"]/["notes"] in order
+```
+
+`--concurrency 1` (the default) takes the same sequential path as
+before — nothing changes unless you opt in. Above that, results come
+back keyed by `patient_idx` and get sorted before they're appended to
+the output lists, so a run with `--concurrency 8` produces CSV rows in
+the same order a sequential run would, regardless of which worker
+finished first. A patient that raises still returns `None` from
+`_generate_one_patient` instead of propagating — one slow or broken
+`I21.0` generation in worker 3 doesn't take down the seven running
+alongside it. `--test-mode` forces concurrency back to 1, since the
+stub-data path is fast enough that a thread pool would just add
+overhead.
 
 ### Where I21.0 actually lives
 
@@ -202,6 +281,73 @@ and surfaced in `generation_summary.json`'s `code_reflection_check.
 unreflected_codes` — the run tells you exactly what didn't land instead
 of quietly shipping it as if it had.
 
+### A second backward pass, this time for prose
+
+The code-reflection check answers "is `I21.0` in here." It has nothing
+to say about whether the note that mentions it is any good, which is
+where `--evaluate-notes` picks up. `evaluate_note` now runs seven
+checks per note: the two free readability metrics, plus five LLM-judged
+ones — fluency, groundedness, relevance, and the two new arrivals,
+factuality and redundancy. `calculate_factuality` in particular is
+built to be auditable rather than just a score:
+
+```python
+def calculate_factuality(note_text: str, reference_material: str, model: str | None = None) -> dict[str, Any]:
+    prompt = evaluation_prompts["calculate_factuality_prompt"].substitute(
+        NOTE=note_text, REFERENCE=reference_material
+    )
+    response = call_llm(prompt, model=model, temp=0.2)
+    return parse_llm_json(response)  # -> factuality_score, unsupported_claim_count, unsupported_claims[]
+```
+
+It doesn't just return a 0–1 plausibility score the way
+`calculate_groundedness` does — it returns a *count* of specific claims
+the note makes that the reference material (the patient/admission JSON)
+doesn't back up, so a low factuality score comes with a list you can
+actually read. All five LLM-judged calls now default to a distinct
+**judge model** — `default_judge_model()` resolves `JUDGE_MODEL` /
+`--judge-model`, falling back to a provider-specific default that's
+deliberately larger than the generation-model default (`claude-opus-4-8`
+for Anthropic, for instance, against a generation default of
+`claude-sonnet-4-6`) — so the same model isn't grading its own
+homework.
+
+Before any of that runs, there's an optional, cheaper filter.
+`--self-consistency-n` generates a note multiple times at a higher
+temperature and calls `assess_note_consistency`, which reuses the exact
+same needle-matching logic as the backward-pass check above — just
+applied across variants of one note instead of across patient/admission/
+journey/notes:
+
+```python
+code_consensus = {
+    key: sum(1 for hits in per_variant_hits if key in hits) / n for key in needles_by_code
+}
+unstable_codes = [key for key, ratio in code_consensus.items() if ratio < consensus_threshold]
+consistency_score = sum(code_consensus.values()) / len(code_consensus)
+best_variant_index = max(range(n), key=lambda i: len(per_variant_hits[i]))
+```
+
+There's no ground-truth note to compare against, so consistency
+*across* generations stands in for correctness: if `I21.0` shows up in
+four out of five variants, that's a stable generation and the odd one
+out gets discarded; the variant reflecting the most driving codes is
+kept. It's a free pre-filter — no judge-model call — that runs before
+the costlier LLM-judged metrics do.
+
+Finally, none of this scoring changes anything on its own unless
+something reads the scores and acts. `step_correct_low_quality_notes`
+does that part: any note scoring below `--quality-threshold` (default
+0.7) on fluency, groundedness, relevance, or factuality — or above a
+fixed redundancy threshold — gets a single targeted rewrite via
+`revise_note_for_quality` and a re-score, the same shape as the
+code-reflection correction loop, just aimed at "is this well-written
+and true" instead of "does this mention `I21.0`." It runs once per
+note, not in a retry loop, and is on by default alongside
+`--evaluate-notes` (`--no-correct-low-quality` to opt out) — the
+project's answer to the difference between measuring quality and doing
+something about it.
+
 ### Two Docker images, one purpose split
 
 By the time `I21.0` has been checked and, if needed, corrected, the
@@ -255,14 +401,17 @@ loose on.
 ### Testing philosophy
 
 None of the above needs a real API key to validate, which matters for
-a project whose core value is a live LLM integration. 13 test files
-cover forward-pass (codes actually reach the prompts), backward-pass
-(the reflection check itself), full pipeline correction/reflection
-wiring end-to-end with `call_llm` mocked, registry genericity, code
-research/search clients, quality metrics, and the Nebius wire format
-against a fake local endpoint. A `--test-mode` flag bypasses all LLM
-calls with stub data for cheap pipeline smoke-testing — you can prove
-the plumbing works before spending a single token on it.
+a project whose core value is a live LLM integration. 14 test files,
+151 tests, cover forward-pass (codes actually reach the prompts),
+backward-pass (the reflection check itself), full pipeline correction/
+reflection wiring end-to-end with `call_llm` mocked, registry
+genericity, code research/search clients, the expanded quality-metric
+suite (factuality, redundancy, judge-model resolution,
+self-consistency, the correction pass), thread-safe concurrent
+generation, and the Nebius wire format against a fake local endpoint. A
+`--test-mode` flag bypasses all LLM calls with stub data for cheap
+pipeline smoke-testing — you can prove the plumbing works before
+spending a single token on it.
 
 ---
 
