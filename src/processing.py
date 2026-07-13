@@ -42,6 +42,13 @@ DEFAULT_OPENAI_MODEL = "gpt-4o"
 DEFAULT_NEBIUS_MODEL = "meta-llama/Meta-Llama-3.1-70B-Instruct-fast"
 DEFAULT_NEBIUS_BASE_URL = "https://api.studio.nebius.com/v1/"
 
+# Judge models used for LLM-graded quality metrics (evaluate_note and
+# friends). Deliberately distinct from (and larger than) the generation
+# model defaults above, to avoid a model grading its own output.
+DEFAULT_ANTHROPIC_JUDGE_MODEL = "claude-opus-4-8"
+DEFAULT_OPENAI_JUDGE_MODEL = "gpt-4o"
+DEFAULT_NEBIUS_JUDGE_MODEL = "meta-llama/Meta-Llama-3.1-70B-Instruct-fast"
+
 # ---------------------------------------------------------------------------
 # LLM client helpers
 # ---------------------------------------------------------------------------
@@ -50,6 +57,25 @@ DEFAULT_NEBIUS_BASE_URL = "https://api.studio.nebius.com/v1/"
 def _get_provider() -> str:
     """Return the configured LLM provider ('anthropic', 'openai', or 'nebius')."""
     return os.environ.get("LLM_PROVIDER", "anthropic").lower().strip()
+
+
+def default_judge_model() -> str:
+    """Resolve the model used to grade notes (evaluate_note and friends).
+
+    Checked in order: the JUDGE_MODEL env var (provider-agnostic override),
+    then a provider-specific default that is deliberately larger/distinct
+    from the generation model default, so the judge isn't the same model
+    grading its own homework.
+    """
+    provider = _get_provider()
+    explicit = os.environ.get("JUDGE_MODEL")
+    if explicit:
+        return explicit
+    if provider == "openai":
+        return DEFAULT_OPENAI_JUDGE_MODEL
+    if provider == "nebius":
+        return DEFAULT_NEBIUS_JUDGE_MODEL
+    return DEFAULT_ANTHROPIC_JUDGE_MODEL
 
 
 def _get_anthropic_client():
@@ -576,6 +602,10 @@ _QUALITY_METRIC_KEYS = (
     "fluency_score",
     "groundedness_score",
     "relevance_score",
+    "factuality_score",
+    "redundancy_score",
+    "unsupported_claim_count",
+    "consistency_score",
 )
 
 
@@ -1030,6 +1060,91 @@ def check_procedure_reflected(
     return check_code_reflected(opcs4_code, code_system, patient, admission, journey, notes)
 
 
+def assess_note_consistency(
+    variants: list[str],
+    driving_codes: list[tuple[str, str]],
+    consensus_threshold: float = 0.8,
+) -> dict[str, Any]:
+    """Self-consistency check across repeated generations of the same note.
+
+    With no ground-truth reference note to score against, generate the same
+    note multiple times (at a higher temperature) and check, per driving
+    code, what fraction of the variants actually reflect that code in the
+    note text. A code reflected in only one of several generations is a
+    statistical outlier for that generation - this is a free, LLM-judge-free
+    proxy for how "unstable" a given note generation is, usable to flag
+    low-consensus notes for extra scrutiny/correction before the (costlier)
+    LLM-judged rubric metrics run, and to pick the most representative
+    variant to keep.
+
+    Args:
+        variants: Independently generated note texts for the same event
+            (e.g. 3-5 generations at temp ~0.7-0.85).
+        driving_codes: List of (code, code_system) tuples that drove
+            generation and are expected to be reflected in the note.
+        consensus_threshold: Minimum fraction of variants a code must
+            appear in to count as consensus/stable (default 0.8, i.e. at
+            least 4 of 5 generations).
+
+    Returns:
+        Dict with:
+        - consistency_score: float 0.0-1.0, mean per-code reflection ratio
+          across variants (1.0 if there are no driving codes to check).
+        - code_consensus: dict of "system:code" -> reflection ratio (0-1).
+        - unstable_codes: list of "system:code" keys below consensus_threshold.
+        - best_variant_index: index into `variants` of the generation that
+          reflects the most driving codes (ties broken by earliest index).
+          None if `variants` is empty.
+    """
+    from src.codes import registry  # noqa: PLC0415
+
+    if not variants:
+        return {
+            "consistency_score": None,
+            "code_consensus": {},
+            "unstable_codes": [],
+            "best_variant_index": None,
+        }
+
+    if not driving_codes:
+        return {
+            "consistency_score": 1.0,
+            "code_consensus": {},
+            "unstable_codes": [],
+            "best_variant_index": 0,
+        }
+
+    needles_by_code: dict[str, set[str]] = {}
+    for code, code_system_key in driving_codes:
+        code_system = registry.get_code_system(code_system_key)
+        info = registry.lookup_code(code_system, code)
+        description = info["description"] if info else ""
+        needles = {code.strip().lower()}
+        needles.update(word.lower() for word in re.findall(r"[A-Za-z]{4,}", description))
+        needles_by_code[f"{code_system_key}:{code}"] = needles
+
+    per_variant_hits: list[set[str]] = []
+    for variant_text in variants:
+        haystack = (variant_text or "").lower()
+        hits = {key for key, needles in needles_by_code.items() if any(n in haystack for n in needles)}
+        per_variant_hits.append(hits)
+
+    n = len(variants)
+    code_consensus = {
+        key: sum(1 for hits in per_variant_hits if key in hits) / n for key in needles_by_code
+    }
+    unstable_codes = [key for key, ratio in code_consensus.items() if ratio < consensus_threshold]
+    consistency_score = sum(code_consensus.values()) / len(code_consensus)
+    best_variant_index = max(range(n), key=lambda i: len(per_variant_hits[i]))
+
+    return {
+        "consistency_score": consistency_score,
+        "code_consensus": code_consensus,
+        "unstable_codes": unstable_codes,
+        "best_variant_index": best_variant_index,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Generate patient record (demographics)
 # ---------------------------------------------------------------------------
@@ -1281,18 +1396,65 @@ def calculate_relevance(note_text: str, reference_material: str, model: str | No
     return parse_llm_json(response)
 
 
+def calculate_factuality(note_text: str, reference_material: str, model: str | None = None) -> dict[str, Any]:
+    """LLM-judged factuality/hallucination audit of a note's claims.
+
+    Unlike calculate_groundedness (a single 0-1 "is this plausible" score),
+    this counts individual unsupported clinical claims against the
+    reference material, giving an auditable hallucination count rather
+    than just a score.
+
+    Args:
+        note_text: Clinical note text.
+        reference_material: Reference context (e.g. admission/patient JSON)
+            claims should be checked against.
+        model: Optional model override.
+
+    Returns:
+        Parsed JSON dict per evaluation_prompts['calculate_factuality_prompt']
+        (factuality_score, unsupported_claim_count, unsupported_claims, etc.).
+    """
+    from src.prompts import evaluation_prompts  # noqa: PLC0415
+
+    prompt = evaluation_prompts["calculate_factuality_prompt"].substitute(
+        NOTE=note_text, REFERENCE=reference_material
+    )
+    response = call_llm(prompt, model=model, temp=0.2)
+    return parse_llm_json(response)
+
+
+def calculate_redundancy(note_text: str, model: str | None = None) -> dict[str, Any]:
+    """LLM-judged redundancy/repetitiveness of a note.
+
+    Args:
+        note_text: Clinical note text.
+        model: Optional model override.
+
+    Returns:
+        Parsed JSON dict per evaluation_prompts['calculate_redundancy_prompt']
+        (redundancy_score, unique_concept_count, redundant_phrases, etc.).
+    """
+    from src.prompts import evaluation_prompts  # noqa: PLC0415
+
+    prompt = evaluation_prompts["calculate_redundancy_prompt"].substitute(NOTE=note_text)
+    response = call_llm(prompt, model=model, temp=0.2)
+    return parse_llm_json(response)
+
+
 def evaluate_note(
     note_text: str,
     reference_material: str,
     model: str | None = None,
 ) -> dict[str, Any]:
     """Evaluate a generated note: objective readability plus LLM-judged
-    fluency/groundedness/relevance.
+    fluency/groundedness/relevance/factuality/redundancy.
 
     Combines calculate_readability_metrics (free, always computed) with
-    calculate_fluency/calculate_groundedness/calculate_relevance (3 LLM
-    calls - meant to be gated behind an opt-in flag by callers, since this
-    triples the LLM cost per note evaluated). Returns a flat dict so the
+    five LLM-judged metrics - meant to be gated behind an opt-in flag by
+    callers, since this is five extra LLM calls per note evaluated. The
+    LLM-judged calls default to a distinct judge model (see
+    default_judge_model) rather than the generation model, unless `model`
+    is explicitly passed to override that. Returns a flat dict so the
     scores can be merged directly onto a note record and flow straight
     into CSV output as extra columns. Any individual metric that fails to
     compute is set to None rather than aborting the whole evaluation.
@@ -1300,24 +1462,26 @@ def evaluate_note(
     Args:
         note_text: Clinical note text to evaluate.
         reference_material: Reference context (e.g. admission/patient JSON)
-            to check groundedness/relevance against.
-        model: Optional model override.
+            to check groundedness/relevance/factuality against.
+        model: Optional judge model override. Defaults to
+            default_judge_model() when not passed.
 
     Returns:
         Flat dict: readability keys plus fluency_score, groundedness_score,
-        relevance_score.
+        relevance_score, factuality_score, redundancy_score.
     """
+    judge_model = model or default_judge_model()
     metrics: dict[str, Any] = calculate_readability_metrics(note_text)
 
     try:
-        metrics["fluency_score"] = calculate_fluency(note_text, model=model).get("fluency_score")
+        metrics["fluency_score"] = calculate_fluency(note_text, model=judge_model).get("fluency_score")
     except Exception as exc:  # noqa: BLE001
         logger.warning("Fluency evaluation failed: %s", exc)
         metrics["fluency_score"] = None
 
     try:
         metrics["groundedness_score"] = calculate_groundedness(
-            note_text, reference_material, model=model
+            note_text, reference_material, model=judge_model
         ).get("groundedness_score")
     except Exception as exc:  # noqa: BLE001
         logger.warning("Groundedness evaluation failed: %s", exc)
@@ -1325,10 +1489,58 @@ def evaluate_note(
 
     try:
         metrics["relevance_score"] = calculate_relevance(
-            note_text, reference_material, model=model
+            note_text, reference_material, model=judge_model
         ).get("relevance_score")
     except Exception as exc:  # noqa: BLE001
         logger.warning("Relevance evaluation failed: %s", exc)
         metrics["relevance_score"] = None
 
+    try:
+        factuality = calculate_factuality(note_text, reference_material, model=judge_model)
+        metrics["factuality_score"] = factuality.get("factuality_score")
+        metrics["unsupported_claim_count"] = factuality.get("unsupported_claim_count")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Factuality evaluation failed: %s", exc)
+        metrics["factuality_score"] = None
+        metrics["unsupported_claim_count"] = None
+
+    try:
+        redundancy = calculate_redundancy(note_text, model=judge_model)
+        metrics["redundancy_score"] = redundancy.get("redundancy_score")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Redundancy evaluation failed: %s", exc)
+        metrics["redundancy_score"] = None
+
     return metrics
+
+
+def revise_note_for_quality(
+    note_text: str,
+    reference_material: str,
+    issues: list[str],
+    model: str | None = None,
+) -> str:
+    """Targeted rewrite of a note that scored below the quality threshold.
+
+    Distinct from correct_note_for_code (which targets a missing driving
+    code): this targets whatever quality issues evaluate_note flagged
+    (low fluency/groundedness/relevance/factuality, or high redundancy).
+
+    Args:
+        note_text: Current note text to revise.
+        reference_material: Reference context (e.g. admission/patient JSON)
+            the revision must stay consistent with.
+        issues: Human-readable issue descriptions to fix (e.g.
+            "groundedness scored 0.40, below the 0.70 threshold").
+        model: Optional model override.
+
+    Returns:
+        Revised note text.
+    """
+    from src.prompts import correction_prompts  # noqa: PLC0415
+
+    issues_str = "\n".join(f"- {issue}" for issue in issues) if issues else "- General quality below threshold."
+    prompt = correction_prompts["revise_note_for_quality_prompt"].substitute(
+        REFERENCE=reference_material, CURRENT_NOTE=note_text, ISSUES=issues_str
+    )
+    return call_llm(prompt, model=model, temp=0.4)

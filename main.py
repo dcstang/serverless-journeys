@@ -61,6 +61,7 @@ import logging
 import os
 import sys
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Any
 
@@ -197,6 +198,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Number of synthetic patients to generate (default: 5).",
     )
     parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=int(os.environ.get("CONCURRENCY", "1")),
+        help=(
+            "Number of patients to generate in parallel (default: 1, sequential). "
+            "Each patient's pipeline (generation, correction, evaluation) is "
+            "independent, so this is a simple thread pool over patient_idx - set it "
+            "to mass-produce notes faster, bounded by your LLM provider's rate "
+            "limits/concurrent-request quota. Ignored (forced to 1) in --test-mode."
+        ),
+    )
+    parser.add_argument(
         "--output-dir",
         type=str,
         default=os.environ.get("OUTPUT_DIR", "data/output"),
@@ -259,9 +272,55 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=os.environ.get("EVALUATE_NOTES", "false").lower() == "true",
         help=(
             "Score generated notes after generation completes: objective readability "
-            "(free) plus LLM-judged fluency/groundedness/relevance (3 extra LLM calls "
-            "per note). Scores are attached as extra columns on each note and averaged "
-            "into generation_summary.json / the run summary. Off by default."
+            "(free) plus LLM-judged fluency/groundedness/relevance/factuality/redundancy "
+            "(5 extra LLM calls per note). Scores are attached as extra columns on each "
+            "note and averaged into generation_summary.json / the run summary. Off by "
+            "default."
+        ),
+    )
+    parser.add_argument(
+        "--judge-model",
+        type=str,
+        default=os.environ.get("JUDGE_MODEL", ""),
+        help=(
+            "LLM model used for --evaluate-notes' LLM-judged metrics. Defaults to a "
+            "model distinct from (and larger than) --model, so generation and judging "
+            "aren't done by the same model. Falls back to a per-provider default "
+            "(see src.processing.default_judge_model) when unset."
+        ),
+    )
+    parser.add_argument(
+        "--self-consistency-n",
+        type=int,
+        default=int(os.environ.get("SELF_CONSISTENCY_N", "1")),
+        help=(
+            "Generate each note this many times (temp ~0.85) and keep the variant "
+            "that reflects the most driving diagnostic/procedure codes, using "
+            "cross-generation code-reflection agreement as a no-ground-truth proxy "
+            "for generation stability (see processing.assess_note_consistency). "
+            "Adds (N-1)x LLM calls per note. Set to 1 (default) to disable and "
+            "generate a single variant as before."
+        ),
+    )
+    parser.add_argument(
+        "--quality-threshold",
+        type=float,
+        default=float(os.environ.get("QUALITY_THRESHOLD", "0.7")),
+        help=(
+            "Minimum acceptable fluency/groundedness/relevance/factuality score "
+            "(0.0-1.0). Only takes effect with --evaluate-notes: notes scoring below "
+            "this are revised once and re-scored. Default: 0.7."
+        ),
+    )
+    parser.add_argument(
+        "--no-correct-low-quality",
+        dest="correct_low_quality",
+        action="store_false",
+        default=os.environ.get("CORRECT_LOW_QUALITY", "true").lower() == "true",
+        help=(
+            "Disable the corrective action pass on low-scoring notes. Only relevant "
+            "with --evaluate-notes; by default low-scoring notes are revised once "
+            "and re-scored against --quality-threshold."
         ),
     )
     parser.add_argument(
@@ -631,6 +690,8 @@ def step_generate_notes(
     apply_abbreviations: bool,
     apply_typos: bool,
     typo_rate: float = 0.02,
+    driving_codes: list[tuple[str, str]] | None = None,
+    self_consistency_n: int = 1,
 ) -> list[dict]:
     """Generate clinical notes for each event in a patient journey.
 
@@ -644,6 +705,14 @@ def step_generate_notes(
         apply_abbreviations: Whether to apply abbreviation augmentation.
         apply_typos: Whether to apply typo augmentation.
         typo_rate: Approximate proportion of words to corrupt when apply_typos is True.
+        driving_codes: List of (code, code_system) tuples used for the
+            self-consistency check (see processing.assess_note_consistency).
+            Ignored when self_consistency_n <= 1.
+        self_consistency_n: When > 1, generate each note this many times (at
+            a higher temperature) and keep the variant that reflects the
+            most driving codes, attaching consistency_score/unstable_codes
+            to the note record as a no-ground-truth stability proxy. When
+            <= 1 (default), generates a single variant as before.
 
     Returns:
         List of clinical note dicts.
@@ -663,6 +732,7 @@ def step_generate_notes(
             event.get("event_date", ""),
         )
 
+        consistency_result: dict | None = None
         if test_mode:
             note_text = _stub_note(event, patient)
         else:
@@ -689,19 +759,32 @@ def step_generate_notes(
                 temp=0.3,
             ) if False else "None identified"
 
-            # Generate the note
+            # Generate the note - once, or self_consistency_n times to
+            # gauge generation stability when no ground-truth note exists
+            # to score against (see processing.assess_note_consistency).
+            n_generations = max(1, self_consistency_n)
             try:
-                note_text = mods["processing"].generate_clinical_note(
-                    patient=patient,
-                    admission=admission,
-                    event=event,
-                    previous_events=previous_events,
-                    note_template_str=template_str,
-                    style_instructions=style,
-                    add_examination=True,
-                    red_flags=red_flags_resp,
-                    model=model,
-                )
+                variants = [
+                    mods["processing"].generate_clinical_note(
+                        patient=patient,
+                        admission=admission,
+                        event=event,
+                        previous_events=previous_events,
+                        note_template_str=template_str,
+                        style_instructions=style,
+                        add_examination=True,
+                        red_flags=red_flags_resp,
+                        model=model,
+                    )
+                    for _ in range(n_generations)
+                ]
+                if n_generations > 1:
+                    consistency_result = mods["processing"].assess_note_consistency(
+                        variants, driving_codes or []
+                    )
+                    note_text = variants[consistency_result["best_variant_index"]]
+                else:
+                    note_text = variants[0]
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Note generation failed for event %d: %s", i, exc)
                 note_text = f"[Note generation failed: {exc}]"
@@ -734,6 +817,9 @@ def step_generate_notes(
             "note_state": "active",
             "event_order": event.get("event_order", i),
         }
+        if consistency_result is not None:
+            note_record["consistency_score"] = consistency_result["consistency_score"]
+            note_record["unstable_codes"] = consistency_result["unstable_codes"]
         notes.append(note_record)
         previous_events.append(event)
 
@@ -907,6 +993,82 @@ def step_evaluate_notes(
             note.update(scores)
         except Exception as exc:  # noqa: BLE001
             logger.warning("  Note evaluation failed for note %s: %s", note.get("clinical_note_id"), exc)
+
+
+_QUALITY_ACTION_METRICS = (
+    ("fluency_score", "fluency"),
+    ("groundedness_score", "groundedness"),
+    ("relevance_score", "clinical relevance"),
+    ("factuality_score", "factuality"),
+)
+_REDUNDANCY_ACTION_THRESHOLD = 0.5
+
+
+def step_correct_low_quality_notes(
+    admission: dict,
+    patient: dict,
+    notes: list[dict],
+    mods: dict,
+    model: str | None,
+    quality_threshold: float,
+) -> int:
+    """Corrective action pass: revise and re-score any note whose
+    evaluate_note scores fell below quality_threshold (or whose redundancy
+    score exceeded the fixed high-redundancy threshold).
+
+    Ensures the evaluation loop doesn't just measure quality but acts on
+    it - runs once per note (a single targeted rewrite, not a retry loop),
+    so a note that still scores poorly after revision is left as-is and
+    logged rather than looped on indefinitely.
+
+    Args:
+        admission: Generated admission dict, used as reference material.
+        patient: Generated patient dict, included in reference material.
+        notes: Generated clinical note list (mutated in place: notes below
+            threshold get clean_note_text/raw_blob_content rewritten and
+            their score columns refreshed).
+        mods: Module namespace dict.
+        model: Optional LLM model override for both the rewrite and the
+            re-evaluation pass.
+        quality_threshold: Minimum acceptable score for fluency/
+            groundedness/relevance/factuality (0.0-1.0).
+
+    Returns:
+        Count of notes that were revised.
+    """
+    processing = mods["processing"]
+    reference_material = json.dumps(
+        {"patient": patient, "admission": admission}, indent=2, default=str
+    )
+
+    n_corrected = 0
+    for note in notes:
+        issues = [
+            f"{label} scored {score:.2f}, below the {quality_threshold:.2f} threshold"
+            for metric, label in _QUALITY_ACTION_METRICS
+            if (score := note.get(metric)) is not None and score < quality_threshold
+        ]
+        redundancy = note.get("redundancy_score")
+        if redundancy is not None and redundancy > _REDUNDANCY_ACTION_THRESHOLD:
+            issues.append(f"redundancy scored {redundancy:.2f} (high) - trim repetitive/filler content")
+
+        if not issues:
+            continue
+
+        try:
+            revised_text = processing.revise_note_for_quality(
+                note.get("clean_note_text", ""), reference_material, issues, model=model
+            )
+            note["clean_note_text"] = revised_text
+            note["raw_blob_content"] = revised_text
+            note.update(processing.evaluate_note(revised_text, reference_material, model=model))
+            n_corrected += 1
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "  Quality correction failed for note %s: %s", note.get("clinical_note_id"), exc
+            )
+
+    return n_corrected
 
 
 # ---------------------------------------------------------------------------
@@ -1117,8 +1279,14 @@ def run_pipeline(args: argparse.Namespace) -> int:
         logger.error("Invalid code system: %s", exc)
         return 1
 
-    # Determine model
+    # Determine model(s). judge_model is deliberately resolved separately
+    # from the generation model - see src.processing.default_judge_model.
     model: str | None = args.model or None
+    judge_model: str | None = args.judge_model or None
+
+    driving_codes: list[tuple[str, str]] = [
+        (code, diagnostic_code_system) for code in diagnostic_codes
+    ] + [(code, procedure_code_system) for code in procedure_codes]
 
     # Collections for all generated data
     all_patients: list[dict] = []
@@ -1130,12 +1298,19 @@ def run_pipeline(args: argparse.Namespace) -> int:
     n_patients = 1 if args.test_mode else args.n_patients
     admission_date = args.admission_date
 
-    # Main generation loop
-    for patient_idx in range(1, n_patients + 1):
-        logger.info(
-            "Generating patient %d/%d...", patient_idx, n_patients
-        )
+    def _generate_one_patient(patient_idx: int) -> dict[str, Any] | None:
+        """Run the full per-patient pipeline (steps 1-7). Returns a result
+        dict, or None if this patient's generation failed (logged here so
+        failures aren't silently swallowed regardless of how the caller
+        iterates - sequentially or via a thread pool).
 
+        Pure w.r.t. shared state: reads only the closed-over, read-only
+        config captured above (mods, model, judge_model, driving_codes,
+        args, code lists) and returns its own patient/admission/journey/
+        notes/reflection_report rather than mutating any shared list, so
+        it's safe to run concurrently across patient_idx values.
+        """
+        logger.info("Generating patient %d/%d...", patient_idx, n_patients)
         try:
             # Step 1: Generate patient demographics
             patient = step_generate_patient(patient_idx, mods, model, args.test_mode)
@@ -1157,19 +1332,18 @@ def run_pipeline(args: argparse.Namespace) -> int:
             admission["discharge_date"] = dis_date
 
             # Step 4: Generate clinical notes for each event
-            logger.info(
-                "  Generating %d clinical notes...", len(journey)
-            )
+            logger.info("  Generating %d clinical notes...", len(journey))
             notes = step_generate_notes(
                 patient, admission, journey, mods, model,
                 args.test_mode, args.apply_abbreviations, args.apply_typos,
-                args.typo_rate,
+                args.typo_rate, driving_codes, args.self_consistency_n,
             )
 
             # Step 5: Backward-pass check (+ targeted correction on a miss) -
             # do the driving codes actually show up in what got generated?
             # Skipped in test mode, since stub notes are placeholder text
             # with no clinical content.
+            reflection_report = None
             if not args.test_mode and (diagnostic_codes or procedure_codes):
                 reflection_report = step_verify_code_reflection(
                     patient, admission, journey, notes,
@@ -1179,30 +1353,74 @@ def run_pipeline(args: argparse.Namespace) -> int:
                     args.research_unknown_codes, args.max_correction_attempts,
                 )
                 admission["code_reflection_check"] = reflection_report
-                all_code_reflection_reports.append(reflection_report)
 
             # Step 6: Quality evaluation (opt-in) - scores the final note
-            # text, after any correction above.
+            # text, after any correction above, using a distinct judge model.
             if not args.test_mode and args.evaluate_notes:
-                step_evaluate_notes(admission, patient, notes, mods, model)
+                step_evaluate_notes(admission, patient, notes, mods, judge_model)
 
-            all_patients.append(patient)
-            all_admissions.append(admission)
-            all_journeys.append(journey)
-            all_notes.append(notes)
+                # Step 7: act on poorly scoring notes - revise and re-score
+                # once, rather than only ever measuring quality.
+                if args.correct_low_quality:
+                    n_corrected = step_correct_low_quality_notes(
+                        admission, patient, notes, mods, model, args.quality_threshold,
+                    )
+                    if n_corrected:
+                        logger.info(
+                            "  Revised and re-scored %d low-scoring note(s)", n_corrected
+                        )
 
             logger.info(
                 "  Patient %d/%d complete: %d events, %d notes",
                 patient_idx, n_patients, len(journey), len(notes)
             )
-
+            return {
+                "patient": patient,
+                "admission": admission,
+                "journey": journey,
+                "notes": notes,
+                "reflection_report": reflection_report,
+            }
         except Exception as exc:  # noqa: BLE001
             logger.error(
                 "Patient %d/%d failed: %s", patient_idx, n_patients, exc,
                 exc_info=args.verbose
             )
-            # Continue with remaining patients
+            return None
+
+    # Main generation loop. concurrency=1 (default) runs sequentially, same
+    # as before; concurrency>1 fans patients out across a thread pool, since
+    # each patient's pipeline is independent and LLM calls are I/O-bound.
+    # Results are collected then sorted back into patient_idx order so
+    # output (CSV row order, logs) is deterministic regardless of which
+    # thread finished first.
+    concurrency = 1 if args.test_mode else max(1, args.concurrency)
+    results: list[tuple[int, dict[str, Any] | None]] = []
+
+    if concurrency == 1:
+        for patient_idx in range(1, n_patients + 1):
+            results.append((patient_idx, _generate_one_patient(patient_idx)))
+    else:
+        logger.info(
+            "Generating %d patients with %d concurrent workers...", n_patients, concurrency
+        )
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            future_to_idx = {
+                executor.submit(_generate_one_patient, patient_idx): patient_idx
+                for patient_idx in range(1, n_patients + 1)
+            }
+            for future in as_completed(future_to_idx):
+                results.append((future_to_idx[future], future.result()))
+
+    for patient_idx, result in sorted(results, key=lambda r: r[0]):
+        if result is None:
             continue
+        all_patients.append(result["patient"])
+        all_admissions.append(result["admission"])
+        all_journeys.append(result["journey"])
+        all_notes.append(result["notes"])
+        if result["reflection_report"] is not None:
+            all_code_reflection_reports.append(result["reflection_report"])
 
     if not all_patients:
         logger.error("No patients generated successfully. Exiting.")
