@@ -61,6 +61,7 @@ import logging
 import os
 import sys
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Any
 
@@ -195,6 +196,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=int(os.environ.get("N_PATIENTS", "5")),
         help="Number of synthetic patients to generate (default: 5).",
+    )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=int(os.environ.get("CONCURRENCY", "1")),
+        help=(
+            "Number of patients to generate in parallel (default: 1, sequential). "
+            "Each patient's pipeline (generation, correction, evaluation) is "
+            "independent, so this is a simple thread pool over patient_idx - set it "
+            "to mass-produce notes faster, bounded by your LLM provider's rate "
+            "limits/concurrent-request quota. Ignored (forced to 1) in --test-mode."
+        ),
     )
     parser.add_argument(
         "--output-dir",
@@ -1285,12 +1298,19 @@ def run_pipeline(args: argparse.Namespace) -> int:
     n_patients = 1 if args.test_mode else args.n_patients
     admission_date = args.admission_date
 
-    # Main generation loop
-    for patient_idx in range(1, n_patients + 1):
-        logger.info(
-            "Generating patient %d/%d...", patient_idx, n_patients
-        )
+    def _generate_one_patient(patient_idx: int) -> dict[str, Any] | None:
+        """Run the full per-patient pipeline (steps 1-7). Returns a result
+        dict, or None if this patient's generation failed (logged here so
+        failures aren't silently swallowed regardless of how the caller
+        iterates - sequentially or via a thread pool).
 
+        Pure w.r.t. shared state: reads only the closed-over, read-only
+        config captured above (mods, model, judge_model, driving_codes,
+        args, code lists) and returns its own patient/admission/journey/
+        notes/reflection_report rather than mutating any shared list, so
+        it's safe to run concurrently across patient_idx values.
+        """
+        logger.info("Generating patient %d/%d...", patient_idx, n_patients)
         try:
             # Step 1: Generate patient demographics
             patient = step_generate_patient(patient_idx, mods, model, args.test_mode)
@@ -1312,9 +1332,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
             admission["discharge_date"] = dis_date
 
             # Step 4: Generate clinical notes for each event
-            logger.info(
-                "  Generating %d clinical notes...", len(journey)
-            )
+            logger.info("  Generating %d clinical notes...", len(journey))
             notes = step_generate_notes(
                 patient, admission, journey, mods, model,
                 args.test_mode, args.apply_abbreviations, args.apply_typos,
@@ -1325,6 +1343,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
             # do the driving codes actually show up in what got generated?
             # Skipped in test mode, since stub notes are placeholder text
             # with no clinical content.
+            reflection_report = None
             if not args.test_mode and (diagnostic_codes or procedure_codes):
                 reflection_report = step_verify_code_reflection(
                     patient, admission, journey, notes,
@@ -1334,7 +1353,6 @@ def run_pipeline(args: argparse.Namespace) -> int:
                     args.research_unknown_codes, args.max_correction_attempts,
                 )
                 admission["code_reflection_check"] = reflection_report
-                all_code_reflection_reports.append(reflection_report)
 
             # Step 6: Quality evaluation (opt-in) - scores the final note
             # text, after any correction above, using a distinct judge model.
@@ -1352,23 +1370,57 @@ def run_pipeline(args: argparse.Namespace) -> int:
                             "  Revised and re-scored %d low-scoring note(s)", n_corrected
                         )
 
-            all_patients.append(patient)
-            all_admissions.append(admission)
-            all_journeys.append(journey)
-            all_notes.append(notes)
-
             logger.info(
                 "  Patient %d/%d complete: %d events, %d notes",
                 patient_idx, n_patients, len(journey), len(notes)
             )
-
+            return {
+                "patient": patient,
+                "admission": admission,
+                "journey": journey,
+                "notes": notes,
+                "reflection_report": reflection_report,
+            }
         except Exception as exc:  # noqa: BLE001
             logger.error(
                 "Patient %d/%d failed: %s", patient_idx, n_patients, exc,
                 exc_info=args.verbose
             )
-            # Continue with remaining patients
+            return None
+
+    # Main generation loop. concurrency=1 (default) runs sequentially, same
+    # as before; concurrency>1 fans patients out across a thread pool, since
+    # each patient's pipeline is independent and LLM calls are I/O-bound.
+    # Results are collected then sorted back into patient_idx order so
+    # output (CSV row order, logs) is deterministic regardless of which
+    # thread finished first.
+    concurrency = 1 if args.test_mode else max(1, args.concurrency)
+    results: list[tuple[int, dict[str, Any] | None]] = []
+
+    if concurrency == 1:
+        for patient_idx in range(1, n_patients + 1):
+            results.append((patient_idx, _generate_one_patient(patient_idx)))
+    else:
+        logger.info(
+            "Generating %d patients with %d concurrent workers...", n_patients, concurrency
+        )
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            future_to_idx = {
+                executor.submit(_generate_one_patient, patient_idx): patient_idx
+                for patient_idx in range(1, n_patients + 1)
+            }
+            for future in as_completed(future_to_idx):
+                results.append((future_to_idx[future], future.result()))
+
+    for patient_idx, result in sorted(results, key=lambda r: r[0]):
+        if result is None:
             continue
+        all_patients.append(result["patient"])
+        all_admissions.append(result["admission"])
+        all_journeys.append(result["journey"])
+        all_notes.append(result["notes"])
+        if result["reflection_report"] is not None:
+            all_code_reflection_reports.append(result["reflection_report"])
 
     if not all_patients:
         logger.error("No patients generated successfully. Exiting.")

@@ -87,6 +87,18 @@ LLM-judged rubric metrics in step 7, so it's a free (no extra judge LLM
 call), code-reflection-based pre-filter rather than a semantic
 consensus check over free-text concepts.
 
+### Concurrency
+
+Each patient runs steps 1-7 independently, so `--concurrency N` fans
+patient generation out across an `N`-worker thread pool instead of
+generating patients one at a time — useful for mass-producing notes.
+Output row order stays deterministic (sorted back into `patient_idx`
+order after generation) regardless of which worker finishes first, and a
+failed patient is logged and skipped without affecting the others,
+concurrent or not. Bound `N` by your LLM provider's concurrent-request/
+rate-limit quota; `--concurrency` is ignored (forced to 1) in
+`--test-mode`.
+
 A patient that fails at any step is logged and skipped; the run
 continues with the next one.
 
@@ -141,6 +153,7 @@ Every flag also has an env-var fallback (see `.env.example`).
 | `--diagnostic-codes` / `--procedure-codes` | — | Comma-separated driving codes |
 | `--diagnostic-code-system` / `--procedure-code-system` | `icd10` / `opcs4` | Any registered coding standard key |
 | `--n-patients` | 5 | Patients to generate |
+| `--concurrency` | 1 | Patients generated in parallel via a thread pool (mass production, bounded by your LLM provider's rate limits) |
 | `--n-events-per-patient` | 8 | Soft target for journey length |
 | `--llm-provider` | `anthropic` | `anthropic` \| `openai` \| `nebius` |
 | `--model` | — | Model id for the selected provider |
