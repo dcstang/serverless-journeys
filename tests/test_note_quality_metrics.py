@@ -8,12 +8,16 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 import main
 from src import processing
 
 _FLUENCY_MARKER = "linguistic fluency"
 _GROUNDEDNESS_MARKER = "grounded in the"
 _RELEVANCE_MARKER = "clinical relevance of a synthetic clinical note"
+_FACTUALITY_MARKER = "unsupported clinical claims"
+_REDUNDANCY_MARKER = "redundant or repetitive"
 
 
 class TestCalculateReadabilityMetrics:
@@ -91,6 +95,53 @@ class TestLlmJudgedMetrics:
         assert result["relevance_score"] == 0.6
 
 
+class TestLlmJudgedFactualityAndRedundancy:
+    def test_calculate_factuality_sends_note_and_reference(self, monkeypatch):
+        captured = {}
+
+        def fake_call_llm(prompt, model=None, temp=0.7, **kw):
+            captured["prompt"] = prompt
+            return json.dumps({"factuality_score": 0.5, "unsupported_claim_count": 2})
+
+        monkeypatch.setattr(processing, "call_llm", fake_call_llm)
+
+        result = processing.calculate_factuality("Note text", "Reference material here")
+
+        assert "Note text" in captured["prompt"]
+        assert "Reference material here" in captured["prompt"]
+        assert result["factuality_score"] == 0.5
+        assert result["unsupported_claim_count"] == 2
+
+    def test_calculate_redundancy_sends_note(self, monkeypatch):
+        captured = {}
+
+        def fake_call_llm(prompt, model=None, temp=0.7, **kw):
+            captured["prompt"] = prompt
+            return json.dumps({"redundancy_score": 0.2})
+
+        monkeypatch.setattr(processing, "call_llm", fake_call_llm)
+
+        result = processing.calculate_redundancy("Note text")
+
+        assert "Note text" in captured["prompt"]
+        assert result["redundancy_score"] == 0.2
+
+
+class TestDefaultJudgeModel:
+    def test_defaults_to_distinct_model_from_generation_default(self, monkeypatch):
+        monkeypatch.delenv("JUDGE_MODEL", raising=False)
+        monkeypatch.delenv("LLM_PROVIDER", raising=False)
+
+        judge_model = processing.default_judge_model()
+
+        assert judge_model != processing.DEFAULT_ANTHROPIC_MODEL
+        assert judge_model == processing.DEFAULT_ANTHROPIC_JUDGE_MODEL
+
+    def test_explicit_env_var_overrides_provider_default(self, monkeypatch):
+        monkeypatch.setenv("JUDGE_MODEL", "some-custom-judge")
+        assert processing.default_judge_model() == "some-custom-judge"
+
+
 class TestEvaluateNote:
     def test_combines_readability_and_llm_scores(self, monkeypatch):
         def fake_call_llm(prompt, model=None, temp=0.7, **kw):
@@ -100,6 +151,10 @@ class TestEvaluateNote:
                 return json.dumps({"groundedness_score": 0.8})
             if _RELEVANCE_MARKER in prompt:
                 return json.dumps({"relevance_score": 0.7})
+            if _FACTUALITY_MARKER in prompt:
+                return json.dumps({"factuality_score": 0.6, "unsupported_claim_count": 1})
+            if _REDUNDANCY_MARKER in prompt:
+                return json.dumps({"redundancy_score": 0.1})
             raise AssertionError(f"unexpected prompt: {prompt[:80]}")
 
         monkeypatch.setattr(processing, "call_llm", fake_call_llm)
@@ -109,6 +164,9 @@ class TestEvaluateNote:
         assert result["fluency_score"] == 0.9
         assert result["groundedness_score"] == 0.8
         assert result["relevance_score"] == 0.7
+        assert result["factuality_score"] == 0.6
+        assert result["unsupported_claim_count"] == 1
+        assert result["redundancy_score"] == 0.1
         assert "flesch_reading_ease" in result
 
     def test_one_failing_metric_does_not_abort_the_others(self, monkeypatch):
@@ -119,6 +177,10 @@ class TestEvaluateNote:
                 return json.dumps({"groundedness_score": 0.8})
             if _RELEVANCE_MARKER in prompt:
                 return json.dumps({"relevance_score": 0.7})
+            if _FACTUALITY_MARKER in prompt:
+                return json.dumps({"factuality_score": 0.6})
+            if _REDUNDANCY_MARKER in prompt:
+                return json.dumps({"redundancy_score": 0.1})
             raise AssertionError(f"unexpected prompt: {prompt[:80]}")
 
         monkeypatch.setattr(processing, "call_llm", fake_call_llm)
@@ -128,6 +190,61 @@ class TestEvaluateNote:
         assert result["fluency_score"] is None
         assert result["groundedness_score"] == 0.8
         assert result["relevance_score"] == 0.7
+        assert result["factuality_score"] == 0.6
+        assert result["redundancy_score"] == 0.1
+
+
+class TestAssessNoteConsistency:
+    def test_no_variants_returns_none_score(self):
+        result = processing.assess_note_consistency([], [("I21.0", "icd10")])
+        assert result["consistency_score"] is None
+        assert result["best_variant_index"] is None
+
+    def test_no_driving_codes_is_full_consensus_and_picks_first(self):
+        result = processing.assess_note_consistency(["a note", "another note"], [])
+        assert result["consistency_score"] == 1.0
+        assert result["best_variant_index"] == 0
+
+    def test_code_reflected_in_all_variants_is_stable(self, monkeypatch):
+        from src.codes import registry
+
+        real_get_code_system = registry.get_code_system
+        icd10_system = real_get_code_system("icd10")
+        monkeypatch.setattr(registry, "get_code_system", lambda key: icd10_system)
+        monkeypatch.setattr(
+            registry, "lookup_code", lambda system, code: {"description": "Myocardial infarction"}
+        )
+
+        variants = [
+            "Patient has myocardial infarction, treated on CCU.",
+            "Admitted with myocardial infarction, started on aspirin.",
+        ]
+        result = processing.assess_note_consistency(variants, [("I21.0", "icd10")])
+
+        assert result["consistency_score"] == 1.0
+        assert result["unstable_codes"] == []
+        assert result["code_consensus"]["icd10:I21.0"] == 1.0
+
+    def test_code_reflected_in_only_one_variant_is_flagged_unstable(self, monkeypatch):
+        from src.codes import registry
+
+        real_get_code_system = registry.get_code_system
+        icd10_system = real_get_code_system("icd10")
+        monkeypatch.setattr(registry, "get_code_system", lambda key: icd10_system)
+        monkeypatch.setattr(
+            registry, "lookup_code", lambda system, code: {"description": "Myocardial infarction"}
+        )
+
+        variants = [
+            "Patient has myocardial infarction, treated on CCU.",
+            "Patient reviewed, stable, no acute issues noted.",
+            "Patient reviewed, discharged home with follow-up.",
+        ]
+        result = processing.assess_note_consistency(variants, [("I21.0", "icd10")])
+
+        assert result["code_consensus"]["icd10:I21.0"] == pytest.approx(1 / 3)
+        assert "icd10:I21.0" in result["unstable_codes"]
+        assert result["best_variant_index"] == 0
 
 
 class TestAverageNoteQualityMetrics:
@@ -298,3 +415,169 @@ class TestEvaluateNotesWiredIntoPipeline:
         # The prompt sent to the fluency evaluator must contain the
         # corrected note text (with the code), not the generic pre-correction draft.
         assert any(code in p for p in call_log)
+
+
+class TestCorrectLowQualityNotes:
+    def test_revises_and_rescores_notes_below_threshold(self, monkeypatch):
+        revise_calls = []
+        evaluate_calls = []
+
+        class FakeProcessing:
+            @staticmethod
+            def revise_note_for_quality(note_text, reference_material, issues, model=None):
+                revise_calls.append((note_text, issues))
+                return "Revised note text."
+
+            @staticmethod
+            def evaluate_note(note_text, reference_material, model=None):
+                evaluate_calls.append(note_text)
+                return {"fluency_score": 0.9, "groundedness_score": 0.9}
+
+        mods = {"processing": FakeProcessing}
+        notes = [
+            {"clinical_note_id": "1", "clean_note_text": "Poor note", "fluency_score": 0.4},
+            {"clinical_note_id": "2", "clean_note_text": "Good note", "fluency_score": 0.9,
+             "groundedness_score": 0.85, "relevance_score": 0.8, "factuality_score": 0.9,
+             "redundancy_score": 0.1},
+        ]
+
+        n_corrected = main.step_correct_low_quality_notes(
+            {"admission_id": "a1"}, {"person_id": "p1"}, notes, mods, model=None,
+            quality_threshold=0.7,
+        )
+
+        assert n_corrected == 1
+        assert len(revise_calls) == 1
+        assert "fluency scored 0.40" in revise_calls[0][1][0]
+        assert notes[0]["clean_note_text"] == "Revised note text."
+        assert notes[0]["fluency_score"] == 0.9
+        assert notes[1]["clean_note_text"] == "Good note"
+
+    def test_no_action_when_all_scores_above_threshold(self):
+        mods = {"processing": None}  # would blow up if called - proves it isn't
+        notes = [
+            {"clinical_note_id": "1", "clean_note_text": "Fine note", "fluency_score": 0.9,
+             "groundedness_score": 0.9, "relevance_score": 0.9, "factuality_score": 0.9,
+             "redundancy_score": 0.1},
+        ]
+
+        n_corrected = main.step_correct_low_quality_notes(
+            {}, {}, notes, mods, model=None, quality_threshold=0.7,
+        )
+
+        assert n_corrected == 0
+        assert notes[0]["clean_note_text"] == "Fine note"
+
+    def test_high_redundancy_alone_triggers_correction(self, monkeypatch):
+        class FakeProcessing:
+            @staticmethod
+            def revise_note_for_quality(note_text, reference_material, issues, model=None):
+                assert "redundancy" in issues[0]
+                return "Trimmed note."
+
+            @staticmethod
+            def evaluate_note(note_text, reference_material, model=None):
+                return {"redundancy_score": 0.1}
+
+        mods = {"processing": FakeProcessing}
+        notes = [
+            {"clinical_note_id": "1", "clean_note_text": "Repetitive note", "fluency_score": 0.9,
+             "groundedness_score": 0.9, "relevance_score": 0.9, "factuality_score": 0.9,
+             "redundancy_score": 0.8},
+        ]
+
+        n_corrected = main.step_correct_low_quality_notes(
+            {}, {}, notes, mods, model=None, quality_threshold=0.7,
+        )
+
+        assert n_corrected == 1
+        assert notes[0]["clean_note_text"] == "Trimmed note."
+
+
+class TestSelfConsistencyPipelineWiring:
+    def test_self_consistency_n_generates_multiple_variants_and_attaches_score(self, tmp_path, monkeypatch):
+        generation_count = {"notes": 0}
+
+        def fake(prompt, model=None, temp=0.7, **kwargs):
+            if _PATIENT_MARKER in prompt:
+                return json.dumps(
+                    {
+                        "full_name": "Test Patient", "first_name": "Test", "surname": "Patient",
+                        "age": 60, "sex": "Male", "nhs_number": "123 456 7890", "mrn": "1234567",
+                    }
+                )
+            if _JOURNEY_MARKER in prompt:
+                return json.dumps(
+                    [
+                        {
+                            "event_type": "ED event", "event_date": "2026-07-08", "event_time": "10:00",
+                            "event_order": 1, "brief_description": "ED assessment", "clinician_type": "Doctor",
+                        }
+                    ]
+                )
+            if _NOTE_MARKER in prompt:
+                generation_count["notes"] += 1
+                return f"Note variant {generation_count['notes']}: managed for I21.0 (STEMI)."
+            return json.dumps({"admission_type": "emergency", "estimated_los_days": 5})
+
+        monkeypatch.setattr(processing, "call_llm", fake)
+
+        args = main.parse_args(
+            [
+                "--diagnostic-codes", "I21.0",
+                "--n-patients", "1",
+                "--output-dir", str(tmp_path),
+                "--max-correction-attempts", "0",
+                "--self-consistency-n", "3",
+            ]
+        )
+        exit_code = main.run_pipeline(args)
+        assert exit_code == 0
+
+        # 3 variants generated for the single note in this journey.
+        assert generation_count["notes"] == 3
+
+        notes_csv = (tmp_path / "synthetic_clinical_notes.csv").read_text()
+        assert "consistency_score" in notes_csv
+
+    def test_self_consistency_defaults_to_single_generation(self, tmp_path, monkeypatch):
+        generation_count = {"notes": 0}
+
+        def fake(prompt, model=None, temp=0.7, **kwargs):
+            if _PATIENT_MARKER in prompt:
+                return json.dumps(
+                    {
+                        "full_name": "Test Patient", "first_name": "Test", "surname": "Patient",
+                        "age": 60, "sex": "Male", "nhs_number": "123 456 7890", "mrn": "1234567",
+                    }
+                )
+            if _JOURNEY_MARKER in prompt:
+                return json.dumps(
+                    [
+                        {
+                            "event_type": "ED event", "event_date": "2026-07-08", "event_time": "10:00",
+                            "event_order": 1, "brief_description": "ED assessment", "clinician_type": "Doctor",
+                        }
+                    ]
+                )
+            if _NOTE_MARKER in prompt:
+                generation_count["notes"] += 1
+                return "Note text."
+            return json.dumps({"admission_type": "emergency", "estimated_los_days": 5})
+
+        monkeypatch.setattr(processing, "call_llm", fake)
+
+        args = main.parse_args(
+            [
+                "--diagnostic-codes", "I21.0",
+                "--n-patients", "1",
+                "--output-dir", str(tmp_path),
+                "--max-correction-attempts", "0",
+            ]
+        )
+        exit_code = main.run_pipeline(args)
+        assert exit_code == 0
+        assert generation_count["notes"] == 1
+
+        notes_csv = (tmp_path / "synthetic_clinical_notes.csv").read_text()
+        assert "consistency_score" not in notes_csv

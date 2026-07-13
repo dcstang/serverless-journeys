@@ -331,6 +331,45 @@ evaluation_prompts: dict[str, Template] = {
         "- diagnosis_specificity_score: float 0.0-1.0\n\n"
         "Return ONLY valid JSON."
     ),
+
+    "calculate_factuality_prompt": Template(
+        "You are auditing a synthetic clinical note for unsupported clinical claims, "
+        "for NHS training data quality assessment.\n\n"
+        "CLINICAL NOTE:\n$NOTE\n\n"
+        "REFERENCE MATERIAL (the only source of truth for this patient/admission):\n"
+        "$REFERENCE\n\n"
+        "Identify every clinical claim in the note (a diagnosis, medication, test "
+        "result, procedure, vital sign, or history item) that is NOT supported by "
+        "the reference material and is not a clinically reasonable, clearly-labelled "
+        "inference from it. A claim is unsupported if it introduces a specific fact "
+        "(e.g. a drug, a lab value, a comorbidity, a past procedure) that has no "
+        "basis anywhere in the reference material.\n\n"
+        "Return a JSON object with:\n"
+        "- unsupported_claims: list of the exact unsupported claim strings found\n"
+        "- unsupported_claim_count: integer, len(unsupported_claims)\n"
+        "- total_claim_count: integer, total number of distinct clinical claims in the note\n"
+        "- factuality_score: float 0.0-1.0 "
+        "(1.0 = every claim supported, computed as "
+        "1 - unsupported_claim_count / max(total_claim_count, 1))\n\n"
+        "Return ONLY valid JSON."
+    ),
+
+    "calculate_redundancy_prompt": Template(
+        "You are assessing a synthetic clinical note for redundant or repetitive "
+        "content, for NHS training data quality assessment.\n\n"
+        "CLINICAL NOTE:\n$NOTE\n\n"
+        "Identify redundancy: restated facts, filler phrasing that adds no clinical "
+        "information, or sections that repeat the same clinical concept more than "
+        "once without adding new detail.\n\n"
+        "Return a JSON object with:\n"
+        "- unique_concept_count: integer, count of distinct clinical concepts "
+        "(diagnoses, findings, medications, actions) mentioned in the note\n"
+        "- redundant_phrase_count: integer, count of restated/repetitive phrases found\n"
+        "- redundant_phrases: list of the repeated phrases/sentences found\n"
+        "- redundancy_score: float 0.0-1.0 "
+        "(0.0 = no redundancy, 1.0 = highly repetitive/padded)\n\n"
+        "Return ONLY valid JSON."
+    ),
 }
 
 # ---------------------------------------------------------------------------
@@ -394,6 +433,18 @@ correction_prompts: dict[str, Template] = {
         "CODE TO INCORPORATE: $CODE\n"
         "CLINICAL CONTEXT:\n$CODE_CONTEXT\n\n"
         "CURRENT NOTE TEXT:\n$CURRENT_NOTE\n\n"
+        "Return the revised note text only - no JSON wrapper, no explanatory comments."
+    ),
+
+    "revise_note_for_quality_prompt": Template(
+        "You are an NHS clinician revising a synthetic clinical note that scored "
+        "poorly on an automated quality review. Revise it to fix the specific issues "
+        "listed below, changing as little else as possible and preserving the note's "
+        "original structure and style. Do not introduce any fact not supported by "
+        "the reference material.\n\n"
+        "REFERENCE MATERIAL (source of truth):\n$REFERENCE\n\n"
+        "CURRENT NOTE TEXT:\n$CURRENT_NOTE\n\n"
+        "ISSUES TO FIX:\n$ISSUES\n\n"
         "Return the revised note text only - no JSON wrapper, no explanatory comments."
     ),
 }
