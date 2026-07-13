@@ -55,7 +55,11 @@ Every one of those is a real LLM call, prompted with the clinical
 context of `I21.0` — not a template with the diagnosis name swapped in.
 That's the easy 80%. The interesting part is what happens next.
 
+![Anatomy of a synthetic patient journey: from a driving ICD-10 code through demographics, admission, journey timeline, to role-specific clinical notes](assets/Boomerang_Synthetic_Patient_Journey_Anatomy.png)
+
 ### It checks its own work
+
+![The out-and-back pipeline: Phase 1 forward pass generation, Phase 2 backward pass verification and 7-point quality evaluation](assets/Verified_Clinical_Data_Pipeline.png)
 
 After that patient is generated, a **backward pass** asks a blunt
 question: does `I21.0` actually show up anywhere in the admission
@@ -101,6 +105,8 @@ rather call an already-running Nebius AI Studio endpoint (or
 Anthropic/OpenAI) instead of self-hosting the model.
 
 ### One patient at a time was never the plan
+
+![Scaling synthetic clinical data: sequential one-at-a-time generation versus concurrent thread-pooled generation, plus the evaluation-that-acts loop](assets/Scaling_Synthetic_Clinical_Data.png)
 
 The pipeline above describes one `I21.0` patient. Ask for fifty and,
 until recently, they generated one after another — each waiting on the
@@ -282,6 +288,8 @@ unreflected_codes` — the run tells you exactly what didn't land instead
 of quietly shipping it as if it had.
 
 ### A second backward pass, this time for prose
+
+![The clinical prose quality loop: self-consistency generation and selection, then judge-model scoring on five metrics against a 0.7 threshold, then targeted corrective rewrite](assets/Boomerang_Clinical_Prose_Quality_Loop.png)
 
 The code-reflection check answers "is `I21.0` in here." It has nothing
 to say about whether the note that mentions it is any good, which is
